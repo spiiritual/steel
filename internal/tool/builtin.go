@@ -2,7 +2,6 @@ package tool
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -13,56 +12,51 @@ import (
 
 // ReadFile returns a tool that reads a text file; relative paths resolve against dir.
 func ReadFile(dir string) Tool {
-	return Tool{
-		Name:        "read_file",
-		Description: "Read a file and return its contents. Relative paths are resolved against the working directory " + dir + ".",
-		Parameters:  json.RawMessage(`{"type":"object","properties":{"path":{"type":"string","description":"File path"}},"required":["path"]}`),
-		Run: func(_ context.Context, raw json.RawMessage) (string, error) {
-			var args struct {
-				Path string `json:"path"`
-			}
-			if err := decodeArgs(raw, &args); err != nil {
-				return "", err
-			}
-			path := args.Path
+	type args struct {
+		Path string `json:"path" desc:"Absolute, or relative to the working directory"`
+	}
+	return New("fs.read_file", "Read a text file. Working directory: "+dir,
+		func(_ context.Context, a args) (string, error) {
+			path := a.Path
 			if !filepath.IsAbs(path) {
 				path = filepath.Join(dir, path)
 			}
 			b, err := os.ReadFile(path)
 			return string(b), err
-		},
-	}
+		})
 }
 
-// bashTimeout bounds a single bash invocation until async jobs exist.
+// bashTimeout bounds a single bash invocation.
 const bashTimeout = 2 * time.Minute
+
+// BashResult is what shell.bash returns.
+type BashResult struct {
+	Output   string `json:"output" desc:"Combined stdout and stderr"`
+	ExitCode int    `json:"exitCode"`
+}
 
 // Bash returns a tool that runs a command with `bash -c` in dir.
 func Bash(dir string) Tool {
-	return Tool{
-		Name:        "bash",
-		Description: fmt.Sprintf("Run a shell command with bash -c in %s and return combined stdout/stderr. Times out after %s.", dir, bashTimeout),
-		Parameters:  json.RawMessage(`{"type":"object","properties":{"cmd":{"type":"string","description":"Command to run"}},"required":["cmd"]}`),
-		Run: func(ctx context.Context, raw json.RawMessage) (string, error) {
-			var args struct {
-				Cmd string `json:"cmd"`
-			}
-			if err := decodeArgs(raw, &args); err != nil {
-				return "", err
-			}
+	type args struct {
+		Cmd string `json:"cmd"`
+	}
+	return New("shell.bash",
+		fmt.Sprintf("Run a command with bash -c in %s. A non-zero exit is a normal result, not an error. Throws if the command runs longer than %s.", dir, bashTimeout),
+		func(ctx context.Context, a args) (BashResult, error) {
 			ctx, cancel := context.WithTimeout(ctx, bashTimeout)
 			defer cancel()
-			c := exec.CommandContext(ctx, "bash", "-c", args.Cmd)
+			c := exec.CommandContext(ctx, "bash", "-c", a.Cmd)
 			c.Dir = dir
 			out, err := c.CombinedOutput()
-			// A non-zero exit is a normal result the model should see, not a tool failure.
-			if exitErr := (*exec.ExitError)(nil); errors.As(err, &exitErr) && ctx.Err() == nil {
-				return fmt.Sprintf("%s[exit status %d]", out, exitErr.ExitCode()), nil
-			}
 			if ctx.Err() != nil {
-				return string(out), fmt.Errorf("command stopped: %w", ctx.Err())
+				return BashResult{}, fmt.Errorf("command stopped: %w", ctx.Err())
 			}
-			return string(out), err
-		},
-	}
+			if exitErr := (*exec.ExitError)(nil); errors.As(err, &exitErr) {
+				return BashResult{Output: string(out), ExitCode: exitErr.ExitCode()}, nil
+			}
+			if err != nil {
+				return BashResult{}, err
+			}
+			return BashResult{Output: string(out)}, nil
+		})
 }

@@ -12,7 +12,9 @@ import (
 	"syscall"
 
 	"github.com/spiiritual/steel/internal/agent"
+	"github.com/spiiritual/steel/internal/channel/terminal"
 	"github.com/spiiritual/steel/internal/llm/openai"
+	"github.com/spiiritual/steel/internal/scratchpad"
 	"github.com/spiiritual/steel/internal/tool"
 )
 
@@ -41,12 +43,23 @@ func run() error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	return agent.New(agent.Config{
+	term := terminal.New(os.Stdin, os.Stdout)
+	pad := scratchpad.New(tool.NewRegistry(tool.ReadFile(cwd), tool.Bash(cwd)), scratchpad.Options{
+		OnCall: func(e scratchpad.CallEvent) {
+			if !e.Done {
+				term.Emit(agent.ToolStart{Name: e.Name, Args: e.Args, Nested: true})
+				return
+			}
+			term.Emit(agent.ToolEnd{Name: e.Name, Result: e.Result, Err: e.Err, Nested: true})
+		},
+	})
+	defer pad.Close()
+
+	return term.Run(ctx, agent.New(agent.Config{
 		Provider: openai.New(*baseURL, os.Getenv("OPENAI_API_KEY")),
 		Model:    *model,
 		System:   *system,
-		Tools:    tool.NewRegistry(tool.ReadFile(cwd), tool.Bash(cwd)),
-		In:       os.Stdin,
-		Out:      os.Stdout,
-	}).Run(ctx)
+		Tools:    pad,
+		Emit:     term.Emit,
+	}))
 }

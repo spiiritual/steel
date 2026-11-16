@@ -1,28 +1,67 @@
-// Package agent contains the core agent loop.
+// Package agent contains the core agent loop. It knows nothing about
+// terminals or chat platforms: it reports what happens as Events, and
+// channels render them.
 package agent
 
 import (
-	"bufio"
 	"context"
+	"encoding/json"
 	"fmt"
-	"io"
-	"strings"
 
 	"github.com/spiiritual/steel/internal/llm"
-	"github.com/spiiritual/steel/internal/tool"
 )
 
-// Config wires an Agent to a model, its tools, and terminal streams.
+// Event is something that happened during a turn.
+type Event interface{ event() }
+
+// TextDelta is a fragment of model text as it streams in.
+type TextDelta struct{ Text string }
+
+// Reply is a complete assistant text message; it follows its TextDeltas.
+type Reply struct{ Text string }
+
+// ToolStart reports a tool call starting. Nested calls are made from inside
+// another tool (e.g. a scratchpad cell) rather than by the model directly.
+type ToolStart struct {
+	ID     string
+	Name   string
+	Args   json.RawMessage
+	Nested bool
+}
+
+// ToolEnd reports a tool call finishing.
+type ToolEnd struct {
+	ID     string
+	Name   string
+	Result string
+	Err    error
+	Nested bool
+}
+
+func (TextDelta) event() {}
+func (Reply) event()     {}
+func (ToolStart) event() {}
+func (ToolEnd) event()   {}
+
+// Toolbox is the set of tools the model can call directly. In steel that is
+// the scratchpad, which offers only run_code.
+type Toolbox interface {
+	Defs() []llm.ToolDef
+	Call(ctx context.Context, name string, args json.RawMessage) (string, error)
+}
+
+// Config wires an Agent to a model and its tools.
 type Config struct {
 	Provider llm.Provider
 	Model    string
-	System   string         // optional system prompt
-	Tools    *tool.Registry // optional; nil means no tools
-	In       io.Reader
-	Out      io.Writer
+	System   string  // optional system prompt
+	Tools    Toolbox // tools advertised to the model; nil means none
+	// Emit receives events. It may be called from multiple goroutines.
+	// Nil discards events.
+	Emit func(Event)
 }
 
-// Agent drives the conversation loop between the user, the model, and tools.
+// Agent holds one conversation and runs turns against the model.
 type Agent struct {
 	cfg     Config
 	history []llm.Message
@@ -30,54 +69,14 @@ type Agent struct {
 
 // New returns a ready-to-run Agent.
 func New(cfg Config) *Agent {
+	if cfg.Emit == nil {
+		cfg.Emit = func(Event) {}
+	}
 	a := &Agent{cfg: cfg}
 	if cfg.System != "" {
 		a.history = append(a.history, llm.Message{Role: llm.RoleSystem, Content: cfg.System})
 	}
 	return a
-}
-
-// Run reads user turns until EOF or ctx is cancelled, streaming each reply.
-func (a *Agent) Run(ctx context.Context) error {
-	lines := make(chan string)
-	readErr := make(chan error, 1)
-	go func() {
-		sc := bufio.NewScanner(a.cfg.In)
-		for sc.Scan() {
-			select {
-			case lines <- sc.Text():
-			case <-ctx.Done():
-				return
-			}
-		}
-		readErr <- sc.Err()
-	}()
-
-	out := a.cfg.Out
-	for {
-		fmt.Fprint(out, "> ")
-		var line string
-		select {
-		case <-ctx.Done():
-			fmt.Fprintln(out)
-			return nil
-		case err := <-readErr:
-			fmt.Fprintln(out)
-			return err
-		case line = <-lines:
-		}
-		line = strings.TrimSpace(line)
-		if line == "" {
-			continue
-		}
-
-		if err := a.Turn(ctx, line); err != nil {
-			if ctx.Err() != nil {
-				return nil
-			}
-			fmt.Fprintln(out, "error:", err)
-		}
-	}
 }
 
 // Turn handles one user message: it calls the model, runs any requested
@@ -92,18 +91,17 @@ func (a *Agent) Turn(ctx context.Context, input string) error {
 		defs = a.cfg.Tools.Defs()
 	}
 
-	out := a.cfg.Out
 	for {
 		reply, err := a.cfg.Provider.Stream(ctx, llm.Request{Model: a.cfg.Model, Messages: a.history, Tools: defs}, func(d string) error {
-			_, err := io.WriteString(out, d)
-			return err
+			a.cfg.Emit(TextDelta{Text: d})
+			return nil
 		})
-		if reply.Content != "" || err != nil {
-			fmt.Fprintln(out)
-		}
 		if err != nil {
 			a.history = a.history[:start]
 			return err
+		}
+		if reply.Content != "" {
+			a.cfg.Emit(Reply{Text: reply.Content})
 		}
 		a.history = append(a.history, reply)
 		if len(reply.ToolCalls) == 0 {
@@ -111,12 +109,12 @@ func (a *Agent) Turn(ctx context.Context, input string) error {
 		}
 
 		for _, call := range reply.ToolCalls {
-			fmt.Fprintf(out, "→ %s %s\n", call.Name, call.Arguments)
+			a.cfg.Emit(ToolStart{ID: call.ID, Name: call.Name, Args: call.Arguments})
 			result, err := a.callTool(ctx, call)
+			a.cfg.Emit(ToolEnd{ID: call.ID, Name: call.Name, Result: result, Err: err})
 			if err != nil {
 				result = "error: " + err.Error()
 			}
-			fmt.Fprintf(out, "  %s\n", summarize(result))
 			a.history = append(a.history, llm.Message{Role: llm.RoleTool, ToolCallID: call.ID, Content: result})
 		}
 	}
@@ -127,17 +125,4 @@ func (a *Agent) callTool(ctx context.Context, call llm.ToolCall) (string, error)
 		return "", fmt.Errorf("no tools available")
 	}
 	return a.cfg.Tools.Call(ctx, call.Name, call.Arguments)
-}
-
-// summarize renders a tool result as one short line for the terminal.
-func summarize(s string) string {
-	t := strings.TrimSpace(s)
-	first, _, _ := strings.Cut(t, "\n")
-	if len(first) > 100 {
-		first = first[:100] + "…"
-	}
-	if first != t {
-		return fmt.Sprintf("← %s (%d bytes)", first, len(s))
-	}
-	return "← " + first
 }

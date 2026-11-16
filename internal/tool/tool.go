@@ -1,25 +1,26 @@
-// Package tool holds the tools the agent can run and the registry that dispatches them.
+// Package tool holds the tools available inside the scratchpad and the
+// registry that dispatches them.
 package tool
 
 import (
 	"context"
 	"encoding/json"
 	"fmt"
-
-	"github.com/spiiritual/steel/internal/llm"
 )
 
-// maxOutput caps tool output returned to the model, in bytes.
-const maxOutput = 64 << 10
-
-// Tool is a function the model can call.
+// Tool is a capability scripts can call as tools.<Name>(args).
 type Tool struct {
+	// Name is dotted: "fs.read_file" is reachable as tools.fs.read_file.
 	Name        string
 	Description string
-	Parameters  json.RawMessage // JSON Schema for the arguments object
-	// Run executes the tool. A returned error is reported to the model as the
-	// tool result; it does not stop the agent.
-	Run func(ctx context.Context, args json.RawMessage) (string, error)
+	// Signature is the TypeScript the model sees after the function name,
+	// covering arguments and result, e.g.
+	// "(args: { path: string }): Promise<string>". It must match what Run
+	// decodes and returns; nothing checks this.
+	Signature string
+	// Run executes the tool. The result must be JSON-serializable; a string
+	// reaches scripts as a JS string, anything else as the equivalent JS value.
+	Run func(ctx context.Context, args json.RawMessage) (any, error)
 }
 
 // Registry is an ordered set of tools.
@@ -40,32 +41,16 @@ func NewRegistry(tools ...Tool) *Registry {
 	return r
 }
 
-// Defs returns the tool definitions to advertise to the model.
-func (r *Registry) Defs() []llm.ToolDef {
-	defs := make([]llm.ToolDef, len(r.tools))
-	for i, t := range r.tools {
-		defs[i] = llm.ToolDef{Name: t.Name, Description: t.Description, Parameters: t.Parameters}
-	}
-	return defs
+// All returns the registered tools in registration order.
+func (r *Registry) All() []Tool {
+	return append([]Tool(nil), r.tools...)
 }
 
-// Call runs the named tool and truncates its output to maxOutput.
-func (r *Registry) Call(ctx context.Context, name string, args json.RawMessage) (string, error) {
+// Call runs the named tool.
+func (r *Registry) Call(ctx context.Context, name string, args json.RawMessage) (any, error) {
 	i, ok := r.index[name]
 	if !ok {
-		return "", fmt.Errorf("unknown tool %q", name)
+		return nil, fmt.Errorf("unknown tool %q", name)
 	}
-	out, err := r.tools[i].Run(ctx, args)
-	if len(out) > maxOutput {
-		out = fmt.Sprintf("%s\n[truncated: %d of %d bytes shown]", out[:maxOutput], maxOutput, len(out))
-	}
-	return out, err
-}
-
-// decodeArgs unmarshals a tool's JSON arguments into v.
-func decodeArgs(args json.RawMessage, v any) error {
-	if err := json.Unmarshal(args, v); err != nil {
-		return fmt.Errorf("invalid arguments: %w", err)
-	}
-	return nil
+	return r.tools[i].Run(ctx, args)
 }

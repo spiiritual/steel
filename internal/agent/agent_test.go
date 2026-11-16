@@ -4,11 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"io"
+	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/spiiritual/steel/internal/llm"
-	"github.com/spiiritual/steel/internal/tool"
 )
 
 // scripted replays canned replies and records the requests it received.
@@ -27,14 +27,18 @@ func (s *scripted) Stream(_ context.Context, req llm.Request, _ func(string) err
 	return s.replies[i], nil
 }
 
-func echoTool() tool.Tool {
-	return tool.Tool{
-		Name:       "echo",
-		Parameters: json.RawMessage(`{"type":"object"}`),
-		Run: func(_ context.Context, args json.RawMessage) (string, error) {
-			return "echoed " + string(args), nil
-		},
+// echoBox offers one tool, "echo", that returns its arguments.
+type echoBox struct{}
+
+func (echoBox) Defs() []llm.ToolDef {
+	return []llm.ToolDef{{Name: "echo", Parameters: json.RawMessage(`{"type":"object"}`)}}
+}
+
+func (echoBox) Call(_ context.Context, name string, args json.RawMessage) (string, error) {
+	if name != "echo" {
+		return "", fmt.Errorf("unknown tool %q", name)
 	}
+	return "echoed " + string(args), nil
 }
 
 func TestTurnRunsToolsUntilFinalAnswer(t *testing.T) {
@@ -45,7 +49,8 @@ func TestTurnRunsToolsUntilFinalAnswer(t *testing.T) {
 		}},
 		{Role: llm.RoleAssistant, Content: "done"},
 	}}
-	ag := New(Config{Provider: p, Model: "m", Tools: tool.NewRegistry(echoTool()), Out: io.Discard})
+	var events []Event
+	ag := New(Config{Provider: p, Model: "m", Tools: echoBox{}, Emit: func(e Event) { events = append(events, e) }})
 
 	if err := ag.Turn(context.Background(), "go"); err != nil {
 		t.Fatal(err)
@@ -70,6 +75,26 @@ func TestTurnRunsToolsUntilFinalAnswer(t *testing.T) {
 	if n := len(ag.history); n != 5 || ag.history[4].Content != "done" {
 		t.Errorf("history = %+v", ag.history)
 	}
+	// Channels rely on this order: start/end per call, then the final reply.
+	want := []string{"start echo", "end echo", "start missing", "end missing error", "reply done"}
+	var seq []string
+	for _, e := range events {
+		switch e := e.(type) {
+		case ToolStart:
+			seq = append(seq, "start "+e.Name)
+		case ToolEnd:
+			s := "end " + e.Name
+			if e.Err != nil {
+				s += " error"
+			}
+			seq = append(seq, s)
+		case Reply:
+			seq = append(seq, "reply "+e.Text)
+		}
+	}
+	if strings.Join(seq, ", ") != strings.Join(want, ", ") {
+		t.Errorf("events = %q, want %q", seq, want)
+	}
 }
 
 func TestTurnRollsBackOnError(t *testing.T) {
@@ -77,7 +102,7 @@ func TestTurnRollsBackOnError(t *testing.T) {
 		replies: []llm.Message{{Role: llm.RoleAssistant, ToolCalls: []llm.ToolCall{{ID: "a", Name: "echo", Arguments: json.RawMessage(`{}`)}}}, {}},
 		errs:    []error{nil, errors.New("boom")},
 	}
-	ag := New(Config{Provider: p, Model: "m", System: "sys", Tools: tool.NewRegistry(echoTool()), Out: io.Discard})
+	ag := New(Config{Provider: p, Model: "m", System: "sys", Tools: echoBox{}})
 
 	if err := ag.Turn(context.Background(), "go"); err == nil {
 		t.Fatal("want error")
