@@ -38,13 +38,39 @@ func New(baseURL, apiKey string) *Client {
 }
 
 type wireMessage struct {
-	Role    llm.Role `json:"role"`
-	Content string   `json:"content"`
+	Role llm.Role `json:"role"`
+	// Content is null on assistant messages that only carry tool calls.
+	Content    *string        `json:"content"`
+	ToolCalls  []wireToolCall `json:"tool_calls,omitempty"`
+	ToolCallID string         `json:"tool_call_id,omitempty"`
+}
+
+type wireToolCall struct {
+	ID       string       `json:"id"`
+	Type     string       `json:"type"`
+	Function wireFunction `json:"function"`
+}
+
+type wireFunction struct {
+	Name      string `json:"name"`
+	Arguments string `json:"arguments"`
+}
+
+type wireTool struct {
+	Type     string      `json:"type"`
+	Function wireToolDef `json:"function"`
+}
+
+type wireToolDef struct {
+	Name        string          `json:"name"`
+	Description string          `json:"description,omitempty"`
+	Parameters  json.RawMessage `json:"parameters"`
 }
 
 type chatRequest struct {
 	Model    string        `json:"model"`
 	Messages []wireMessage `json:"messages"`
+	Tools    []wireTool    `json:"tools,omitempty"`
 	Stream   bool          `json:"stream"`
 }
 
@@ -55,19 +81,49 @@ type apiError struct {
 type chunk struct {
 	Choices []struct {
 		Delta struct {
-			Content string `json:"content"`
+			Content   string `json:"content"`
+			ToolCalls []struct {
+				Index    int    `json:"index"`
+				ID       string `json:"id"`
+				Function struct {
+					Name      string `json:"name"`
+					Arguments string `json:"arguments"`
+				} `json:"function"`
+			} `json:"tool_calls"`
 		} `json:"delta"`
 	} `json:"choices"`
 	Error *apiError `json:"error"`
 }
 
-// Stream implements llm.Provider.
-func (c *Client) Stream(ctx context.Context, req llm.Request, onDelta func(string) error) (llm.Message, error) {
+func toWire(req llm.Request) chatRequest {
 	msgs := make([]wireMessage, len(req.Messages))
 	for i, m := range req.Messages {
-		msgs[i] = wireMessage{Role: m.Role, Content: m.Content}
+		w := wireMessage{Role: m.Role, ToolCallID: m.ToolCallID}
+		if m.Content != "" || len(m.ToolCalls) == 0 {
+			w.Content = &m.Content
+		}
+		for _, tc := range m.ToolCalls {
+			w.ToolCalls = append(w.ToolCalls, wireToolCall{
+				ID:       tc.ID,
+				Type:     "function",
+				Function: wireFunction{Name: tc.Name, Arguments: string(tc.Arguments)},
+			})
+		}
+		msgs[i] = w
 	}
-	body, err := json.Marshal(chatRequest{Model: req.Model, Messages: msgs, Stream: true})
+	var tools []wireTool
+	for _, t := range req.Tools {
+		tools = append(tools, wireTool{
+			Type:     "function",
+			Function: wireToolDef{Name: t.Name, Description: t.Description, Parameters: t.Parameters},
+		})
+	}
+	return chatRequest{Model: req.Model, Messages: msgs, Tools: tools, Stream: true}
+}
+
+// Stream implements llm.Provider.
+func (c *Client) Stream(ctx context.Context, req llm.Request, onDelta func(string) error) (llm.Message, error) {
+	body, err := json.Marshal(toWire(req))
 	if err != nil {
 		return llm.Message{}, err
 	}
@@ -93,6 +149,13 @@ func (c *Client) Stream(ctx context.Context, req llm.Request, onDelta func(strin
 	}
 
 	var text strings.Builder
+	// Tool call fragments arrive keyed by index; arguments are split across chunks.
+	type partialCall struct {
+		id, name string
+		args     strings.Builder
+	}
+	var calls []*partialCall
+
 	sc := bufio.NewScanner(resp.Body)
 	sc.Buffer(make([]byte, 0, 64*1024), 1<<20)
 	for sc.Scan() {
@@ -118,12 +181,41 @@ func (c *Client) Stream(ctx context.Context, req llm.Request, onDelta func(strin
 					return llm.Message{}, err
 				}
 			}
+			for _, tc := range choice.Delta.ToolCalls {
+				if tc.Index < 0 || tc.Index > len(calls) {
+					return llm.Message{}, fmt.Errorf("tool call index %d out of order", tc.Index)
+				}
+				if tc.Index == len(calls) {
+					calls = append(calls, &partialCall{})
+				}
+				p := calls[tc.Index]
+				if tc.ID != "" {
+					p.id = tc.ID
+				}
+				if tc.Function.Name != "" {
+					p.name = tc.Function.Name
+				}
+				p.args.WriteString(tc.Function.Arguments)
+			}
 		}
 	}
 	if err := sc.Err(); err != nil {
 		return llm.Message{}, err
 	}
-	return llm.Message{Role: llm.RoleAssistant, Content: text.String()}, nil
+
+	msg := llm.Message{Role: llm.RoleAssistant, Content: text.String()}
+	for i, p := range calls {
+		id := p.id
+		if id == "" { // some local servers omit ids; tool results must reference one
+			id = fmt.Sprintf("call_%d", i)
+		}
+		args := p.args.String()
+		if args == "" {
+			args = "{}"
+		}
+		msg.ToolCalls = append(msg.ToolCalls, llm.ToolCall{ID: id, Name: p.name, Arguments: json.RawMessage(args)})
+	}
+	return msg, nil
 }
 
 func statusError(resp *http.Response) error {

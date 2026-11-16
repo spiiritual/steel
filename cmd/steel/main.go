@@ -13,6 +13,7 @@ import (
 
 	"github.com/spiiritual/steel/internal/agent"
 	"github.com/spiiritual/steel/internal/llm/openai"
+	"github.com/spiiritual/steel/internal/tool"
 )
 
 func main() {
@@ -32,6 +33,11 @@ func run() error {
 		return errors.New("no model: pass -model or set OPENAI_MODEL")
 	}
 
+	cwd, err := os.Getwd()
+	if err != nil {
+		return err
+	}
+
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
@@ -39,6 +45,7 @@ func run() error {
 		Provider: openai.New(*baseURL, os.Getenv("OPENAI_API_KEY")),
 		Model:    *model,
 		System:   *system,
+		Tools:    tool.NewRegistry(tool.ReadFile(cwd), tool.Bash(cwd)),
 		In:       os.Stdin,
 		Out:      os.Stdout,
 	}).Run(ctx)

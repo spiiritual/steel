@@ -22,7 +22,8 @@ func TestStreamAccumulatesDeltas(t *testing.T) {
 		}
 		var req chatRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			t.Fatal(err)
+			t.Error(err)
+			return
 		}
 		if req.Model != "m" || !req.Stream || len(req.Messages) != 1 || req.Messages[0].Role != llm.RoleUser {
 			t.Errorf("unexpected request: %+v", req)
@@ -75,5 +76,72 @@ func TestStreamErrors(t *testing.T) {
 				t.Errorf("err = %v, want suffix %q", err, tt.want)
 			}
 		})
+	}
+}
+
+func TestStreamToolCalls(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Error(err)
+			return
+		}
+		msgs := req["messages"].([]any)
+		asst := msgs[1].(map[string]any)
+		if c, ok := asst["content"]; !ok || c != nil {
+			t.Errorf("tool-call-only assistant content = %#v, want null", c)
+		}
+		call := asst["tool_calls"].([]any)[0].(map[string]any)
+		fn := call["function"].(map[string]any)
+		if call["id"] != "c0" || call["type"] != "function" || fn["name"] != "bash" || fn["arguments"] != `{"cmd":"ls"}` {
+			t.Errorf("assistant tool_call = %#v", call)
+		}
+		toolMsg := msgs[2].(map[string]any)
+		if toolMsg["role"] != "tool" || toolMsg["tool_call_id"] != "c0" || toolMsg["content"] != "a.go" {
+			t.Errorf("tool message = %#v", toolMsg)
+		}
+		tools := req["tools"].([]any)
+		if tf := tools[0].(map[string]any)["function"].(map[string]any); tf["name"] != "bash" || tf["parameters"] == nil {
+			t.Errorf("tools = %#v", tools)
+		}
+
+		// Two parallel calls; names and ids arrive once, arguments are split.
+		for _, c := range []string{
+			`{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"x1","type":"function","function":{"name":"read_file","arguments":""}}]}}]}`,
+			`{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"path\":"}}]}}]}`,
+			`{"choices":[{"delta":{"tool_calls":[{"index":1,"id":"x2","type":"function","function":{"name":"bash","arguments":"{\"cmd\":\"pwd\"}"}}]}}]}`,
+			`{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"go.mod\"}"}}]}}]}`,
+		} {
+			fmt.Fprintf(w, "data: %s\n\n", c)
+		}
+		fmt.Fprint(w, "data: [DONE]\n\n")
+	}))
+	defer srv.Close()
+
+	params := json.RawMessage(`{"type":"object"}`)
+	msg, err := New(srv.URL, "").Stream(context.Background(), llm.Request{
+		Model: "m",
+		Messages: []llm.Message{
+			{Role: llm.RoleUser, Content: "list"},
+			{Role: llm.RoleAssistant, ToolCalls: []llm.ToolCall{{ID: "c0", Name: "bash", Arguments: json.RawMessage(`{"cmd":"ls"}`)}}},
+			{Role: llm.RoleTool, ToolCallID: "c0", Content: "a.go"},
+		},
+		Tools: []llm.ToolDef{{Name: "bash", Parameters: params}},
+	}, func(string) error { return nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []llm.ToolCall{
+		{ID: "x1", Name: "read_file", Arguments: json.RawMessage(`{"path":"go.mod"}`)},
+		{ID: "x2", Name: "bash", Arguments: json.RawMessage(`{"cmd":"pwd"}`)},
+	}
+	if len(msg.ToolCalls) != len(want) {
+		t.Fatalf("tool calls = %+v", msg.ToolCalls)
+	}
+	for i, w := range want {
+		got := msg.ToolCalls[i]
+		if got.ID != w.ID || got.Name != w.Name || string(got.Arguments) != string(w.Arguments) {
+			t.Errorf("call %d = %+v, want %+v (args %s)", i, got, w, got.Arguments)
+		}
 	}
 }
