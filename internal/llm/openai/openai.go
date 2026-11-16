@@ -91,6 +91,7 @@ type chunk struct {
 				} `json:"function"`
 			} `json:"tool_calls"`
 		} `json:"delta"`
+		FinishReason string `json:"finish_reason"`
 	} `json:"choices"`
 	Error *apiError `json:"error"`
 }
@@ -106,7 +107,7 @@ func toWire(req llm.Request) chatRequest {
 			w.ToolCalls = append(w.ToolCalls, wireToolCall{
 				ID:       tc.ID,
 				Type:     "function",
-				Function: wireFunction{Name: tc.Name, Arguments: string(tc.Arguments)},
+				Function: wireFunction{Name: tc.Name, Arguments: tc.Arguments},
 			})
 		}
 		msgs[i] = w
@@ -147,6 +148,14 @@ func (c *Client) Stream(ctx context.Context, req llm.Request, onDelta func(strin
 	if resp.StatusCode != http.StatusOK {
 		return llm.Message{}, fmt.Errorf("POST %s: %w", httpReq.URL, statusError(resp))
 	}
+	if ct := resp.Header.Get("Content-Type"); !strings.HasPrefix(strings.ToLower(strings.TrimSpace(ct)), "text/event-stream") {
+		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 500))
+		return llm.Message{}, fmt.Errorf("POST %s: unexpected content type %q (want text/event-stream): %s", httpReq.URL, ct, raw)
+	}
+
+	// A complete stream ends with [DONE] or a finish_reason (some servers omit [DONE]).
+	var done bool
+	var finish string
 
 	var text strings.Builder
 	// Tool call fragments arrive keyed by index; arguments are split across chunks.
@@ -165,6 +174,7 @@ func (c *Client) Stream(ctx context.Context, req llm.Request, onDelta func(strin
 		}
 		data = strings.TrimSpace(data)
 		if data == "[DONE]" {
+			done = true
 			break
 		}
 		var ch chunk
@@ -175,6 +185,9 @@ func (c *Client) Stream(ctx context.Context, req llm.Request, onDelta func(strin
 			return llm.Message{}, fmt.Errorf("api error: %s", ch.Error.Message)
 		}
 		for _, choice := range ch.Choices {
+			if choice.FinishReason != "" {
+				finish = choice.FinishReason
+			}
 			if d := choice.Delta.Content; d != "" {
 				text.WriteString(d)
 				if err := onDelta(d); err != nil {
@@ -202,6 +215,9 @@ func (c *Client) Stream(ctx context.Context, req llm.Request, onDelta func(strin
 	if err := sc.Err(); err != nil {
 		return llm.Message{}, err
 	}
+	if !done && finish == "" {
+		return llm.Message{}, fmt.Errorf("stream ended before completion: %w", io.ErrUnexpectedEOF)
+	}
 
 	msg := llm.Message{Role: llm.RoleAssistant, Content: text.String()}
 	for i, p := range calls {
@@ -213,7 +229,10 @@ func (c *Client) Stream(ctx context.Context, req llm.Request, onDelta func(strin
 		if args == "" {
 			args = "{}"
 		}
-		msg.ToolCalls = append(msg.ToolCalls, llm.ToolCall{ID: id, Name: p.name, Arguments: json.RawMessage(args)})
+		msg.ToolCalls = append(msg.ToolCalls, llm.ToolCall{ID: id, Name: p.name, Arguments: args})
+	}
+	if finish == "length" {
+		return msg, llm.ErrTruncated
 	}
 	return msg, nil
 }

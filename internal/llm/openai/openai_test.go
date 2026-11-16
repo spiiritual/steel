@@ -3,7 +3,9 @@ package openai
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -64,6 +66,7 @@ func TestStreamErrors(t *testing.T) {
 			fmt.Fprint(w, `{"error":{"message":"bad key"}}`)
 		}, "/chat/completions: 401 Unauthorized: bad key"},
 		{"in-stream error", func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "text/event-stream")
 			fmt.Fprint(w, `data: {"error":{"message":"overloaded"}}`+"\n\n")
 		}, "api error: overloaded"},
 	}
@@ -104,7 +107,7 @@ func TestStreamToolCalls(t *testing.T) {
 		if tf := tools[0].(map[string]any)["function"].(map[string]any); tf["name"] != "bash" || tf["parameters"] == nil {
 			t.Errorf("tools = %#v", tools)
 		}
-
+		w.Header().Set("Content-Type", "text/event-stream")
 		// Two parallel calls; names and ids arrive once, arguments are split.
 		for _, c := range []string{
 			`{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"x1","type":"function","function":{"name":"read_file","arguments":""}}]}}]}`,
@@ -123,7 +126,7 @@ func TestStreamToolCalls(t *testing.T) {
 		Model: "m",
 		Messages: []llm.Message{
 			{Role: llm.RoleUser, Content: "list"},
-			{Role: llm.RoleAssistant, ToolCalls: []llm.ToolCall{{ID: "c0", Name: "bash", Arguments: json.RawMessage(`{"cmd":"ls"}`)}}},
+			{Role: llm.RoleAssistant, ToolCalls: []llm.ToolCall{{ID: "c0", Name: "bash", Arguments: `{"cmd":"ls"}`}}},
 			{Role: llm.RoleTool, ToolCallID: "c0", Content: "a.go"},
 		},
 		Tools: []llm.ToolDef{{Name: "bash", Parameters: params}},
@@ -132,16 +135,105 @@ func TestStreamToolCalls(t *testing.T) {
 		t.Fatal(err)
 	}
 	want := []llm.ToolCall{
-		{ID: "x1", Name: "read_file", Arguments: json.RawMessage(`{"path":"go.mod"}`)},
-		{ID: "x2", Name: "bash", Arguments: json.RawMessage(`{"cmd":"pwd"}`)},
+		{ID: "x1", Name: "read_file", Arguments: `{"path":"go.mod"}`},
+		{ID: "x2", Name: "bash", Arguments: `{"cmd":"pwd"}`},
 	}
 	if len(msg.ToolCalls) != len(want) {
 		t.Fatalf("tool calls = %+v", msg.ToolCalls)
 	}
 	for i, w := range want {
 		got := msg.ToolCalls[i]
-		if got.ID != w.ID || got.Name != w.Name || string(got.Arguments) != string(w.Arguments) {
-			t.Errorf("call %d = %+v, want %+v (args %s)", i, got, w, got.Arguments)
+		if got != w {
+			t.Errorf("call %d = %+v, want %+v", i, got, w)
 		}
+	}
+}
+
+// sse serves the given data lines as an event stream.
+func sse(lines ...string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
+		for _, l := range lines {
+			fmt.Fprintf(w, "data: %s\n\n", l)
+		}
+	}
+}
+
+func stream(t *testing.T, h http.Handler, req llm.Request) (llm.Message, error) {
+	t.Helper()
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+	if req.Model == "" {
+		req.Model = "m"
+	}
+	return New(srv.URL, "").Stream(context.Background(), req, func(string) error { return nil })
+}
+
+func TestStreamInvalidArgumentsInHistory(t *testing.T) {
+	const bad = `{"cmd":"ls`
+	var gotArgs any
+	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Error(err)
+			return
+		}
+		call := req["messages"].([]any)[0].(map[string]any)["tool_calls"].([]any)[0].(map[string]any)
+		gotArgs = call["function"].(map[string]any)["arguments"]
+		sse(`{"choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}]}`, "[DONE]")(w, r)
+	})
+	history := []llm.Message{{Role: llm.RoleAssistant, ToolCalls: []llm.ToolCall{{ID: "c0", Name: "bash", Arguments: bad}}}}
+	raw, err := json.Marshal(history)
+	if err != nil {
+		t.Fatalf("marshal history: %v", err)
+	}
+	var back []llm.Message
+	if err := json.Unmarshal(raw, &back); err != nil || back[0].ToolCalls[0].Arguments != bad {
+		t.Fatalf("round trip = %+v, %v", back, err)
+	}
+	if _, err := stream(t, h, llm.Request{Messages: back}); err != nil {
+		t.Fatal(err)
+	}
+	if gotArgs != bad {
+		t.Errorf("wire arguments = %#v, want %q", gotArgs, bad)
+	}
+}
+
+func TestStreamFinishWithoutDone(t *testing.T) {
+	msg, err := stream(t, sse(`{"choices":[{"delta":{"content":"hi"},"finish_reason":"stop"}]}`), llm.Request{})
+	if err != nil || msg.Content != "hi" {
+		t.Fatalf("msg = %+v, err = %v", msg, err)
+	}
+}
+
+func TestStreamUnexpectedEOF(t *testing.T) {
+	_, err := stream(t, sse(`{"choices":[{"delta":{"content":"partial"}}]}`), llm.Request{})
+	if !errors.Is(err, io.ErrUnexpectedEOF) {
+		t.Fatalf("err = %v, want io.ErrUnexpectedEOF", err)
+	}
+}
+
+func TestStreamNonSSE(t *testing.T) {
+	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"choices":[{"message":{"content":"hi"}}]}`)
+	})
+	_, err := stream(t, h, llm.Request{})
+	if err == nil || !strings.Contains(err.Error(), "application/json") || !strings.Contains(err.Error(), `"content":"hi"`) {
+		t.Fatalf("err = %v", err)
+	}
+}
+
+func TestStreamTruncated(t *testing.T) {
+	msg, err := stream(t, sse(
+		`{"choices":[{"delta":{"content":"cut","tool_calls":[{"index":0,"id":"x","function":{"name":"bash","arguments":"{\"cmd\":"}}]}}]}`,
+		`{"choices":[{"delta":{},"finish_reason":"length"}]}`,
+		"[DONE]",
+	), llm.Request{})
+	if !errors.Is(err, llm.ErrTruncated) {
+		t.Fatalf("err = %v, want ErrTruncated", err)
+	}
+	if msg.Content != "cut" || len(msg.ToolCalls) != 1 || msg.ToolCalls[0].Arguments != `{"cmd":` {
+		t.Errorf("msg = %+v", msg)
 	}
 }

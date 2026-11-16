@@ -3,6 +3,7 @@ package tool
 import (
 	"bytes"
 	"context"
+	"encoding"
 	"encoding/json"
 	"fmt"
 	"reflect"
@@ -14,8 +15,9 @@ import (
 // New builds a Tool from a typed function. The TypeScript signature the model
 // sees is generated from A and R, so the Go types are the single source of
 // truth. Struct fields use their json tags for names; a `desc` tag becomes a
-// doc comment; pointer and omitempty fields are optional. Unknown argument
-// fields are rejected.
+// doc comment; omitempty and omitzero fields are optional. Types mirror
+// encoding/json: pointers, slices and maps admit null unless the field omits
+// them. Unknown argument fields are rejected.
 func New[A, R any](name, description string, fn func(ctx context.Context, args A) (R, error)) Tool {
 	argsT := reflect.TypeFor[A]()
 	params := "args: " + tsType(argsT, 0, nil)
@@ -41,18 +43,53 @@ func New[A, R any](name, description string, fn func(ctx context.Context, args A
 }
 
 var (
-	timeType      = reflect.TypeFor[time.Time]()
-	marshalerType = reflect.TypeFor[json.Marshaler]()
+	timeType          = reflect.TypeFor[time.Time]()
+	marshalerType     = reflect.TypeFor[json.Marshaler]()
+	textMarshalerType = reflect.TypeFor[encoding.TextMarshaler]()
 )
 
 // tsType renders t as the TypeScript type of its JSON encoding. depth sets
 // indentation for multi-line objects; seen guards against recursive types.
 func tsType(t reflect.Type, depth int, seen map[reflect.Type]bool) string {
+	s := tsBase(t, depth, seen)
+	if nullable(t) {
+		s += " | null"
+	}
+	return s
+}
+
+// customEncoding reports whether encoding/json defers to t's own marshaling.
+// Only value receivers count: pointer-receiver methods apply only to
+// addressable values, which the type alone can't tell.
+func customEncoding(t reflect.Type) bool {
+	return t.Kind() != reflect.Pointer && (t.Implements(marshalerType) || t.Implements(textMarshalerType))
+}
+
+// nullable reports whether a value of type t can encode as JSON null.
+// Interfaces render as unknown, which already covers null.
+func nullable(t reflect.Type) bool {
+	if t == timeType || customEncoding(t) {
+		return false
+	}
+	switch t.Kind() {
+	case reflect.Pointer, reflect.Slice, reflect.Map:
+		return true
+	}
+	return false
+}
+
+// tsBase renders t's encoding without the null that nullable(t) adds.
+func tsBase(t reflect.Type, depth int, seen map[reflect.Type]bool) string {
 	if t == timeType {
 		return "string"
 	}
-	if t.Kind() != reflect.Pointer && t.Implements(marshalerType) {
-		return "unknown" // custom encoding: shape unknowable from the type
+	if t.Kind() != reflect.Pointer {
+		if t.Implements(marshalerType) {
+			return "unknown" // custom encoding: shape unknowable from the type
+		}
+		if t.Implements(textMarshalerType) {
+			return "string"
+		}
 	}
 	switch t.Kind() {
 	case reflect.String:
@@ -64,13 +101,13 @@ func tsType(t reflect.Type, depth int, seen map[reflect.Type]bool) string {
 		reflect.Float32, reflect.Float64:
 		return "number"
 	case reflect.Pointer:
-		return tsType(t.Elem(), depth, seen) + " | null"
+		return tsBase(t.Elem(), depth, seen)
 	case reflect.Slice, reflect.Array:
-		if t.Elem().Kind() == reflect.Uint8 {
-			return "string" // encoding/json base64-encodes byte slices
+		if t.Kind() == reflect.Slice && t.Elem().Kind() == reflect.Uint8 && !customEncoding(t.Elem()) {
+			return "string" // encoding/json base64-encodes byte slices, not arrays
 		}
 		el := tsType(t.Elem(), depth, seen)
-		if t.Elem().Kind() == reflect.Pointer { // "T | null" needs grouping
+		if nullable(t.Elem()) { // "T | null" needs grouping
 			el = "(" + el + ")"
 		}
 		return el + "[]"
@@ -89,6 +126,15 @@ func tsType(t reflect.Type, depth int, seen map[reflect.Type]bool) string {
 	default: // interface, func, chan, ...
 		return "unknown"
 	}
+}
+
+// tsOmittable renders the type of an omitempty/omitzero field when present:
+// a nil pointer, slice or map is omitted rather than encoded as null.
+func tsOmittable(t reflect.Type, depth int, seen map[reflect.Type]bool) string {
+	if t.Kind() == reflect.Pointer {
+		return tsType(t.Elem(), depth, seen)
+	}
+	return tsBase(t, depth, seen)
 }
 
 type field struct {
@@ -127,9 +173,6 @@ func fields(t reflect.Type) []field {
 			name = f.Name
 		}
 		optional := strings.Contains(opts, "omitempty") || strings.Contains(opts, "omitzero")
-		if ft.Kind() == reflect.Pointer {
-			optional, ft = true, ft.Elem()
-		}
 		out = append(out, field{name: name, optional: optional, desc: f.Tag.Get("desc"), t: ft})
 	}
 	return out
@@ -148,11 +191,10 @@ func tsObject(t reflect.Type, depth int, seen map[reflect.Type]bool) string {
 		}
 	}
 	member := func(f field, d int) string {
-		opt := ""
 		if f.optional {
-			opt = "?"
+			return fmt.Sprintf("%s?: %s;", TSKey(f.name), tsOmittable(f.t, d, seen))
 		}
-		return fmt.Sprintf("%s%s: %s;", TSKey(f.name), opt, tsType(f.t, d, seen))
+		return fmt.Sprintf("%s: %s;", TSKey(f.name), tsType(f.t, d, seen))
 	}
 	if !multiline {
 		parts := make([]string, len(fs))

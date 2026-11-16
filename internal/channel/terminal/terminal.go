@@ -1,4 +1,4 @@
-// Package terminal is a line-based channel for talking to the agent locally.
+// Package terminal is a line-based channel for talking to steel locally.
 package terminal
 
 import (
@@ -9,11 +9,15 @@ import (
 	"io"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/spiiritual/steel/internal/agent"
 )
 
-// Terminal reads user lines from in and renders agent events to out.
+// ChatID is the session ID the terminal uses.
+const ChatID = "terminal"
+
+// Terminal reads user lines from in and renders session events to out.
 type Terminal struct {
 	in  io.Reader
 	mu  sync.Mutex
@@ -28,7 +32,7 @@ func New(in io.Reader, out io.Writer) *Terminal {
 }
 
 // Emit renders one event. It is safe for concurrent use.
-func (t *Terminal) Emit(e agent.Event) {
+func (t *Terminal) Emit(_ string, e agent.Event) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	switch e := e.(type) {
@@ -65,15 +69,28 @@ func (t *Terminal) Emit(e agent.Event) {
 			return
 		}
 		t.write(indent + "← " + summarize(e.Result) + "\n")
+	case agent.Notice:
+		t.newline()
+		t.write("· " + e.Text + "\n")
+		t.write("> ")
+	case agent.TurnDone:
+		t.newline()
+		if e.Err != nil {
+			t.write("error: " + e.Err.Error() + "\n")
+		}
+		t.write("> ")
 	}
 }
 
-// Run reads lines until EOF or ctx is cancelled, running one turn per line.
-func (t *Terminal) Run(ctx context.Context, a *agent.Agent) error {
+// Run sends each input line to the terminal's session until ctx is
+// cancelled or input ends. At end of input it waits for the session to go
+// idle, including background jobs, so piped input sees every result.
+func (t *Terminal) Run(ctx context.Context, ss *agent.Sessions) error {
 	lines := make(chan string)
 	readErr := make(chan error, 1)
 	go func() {
 		sc := bufio.NewScanner(t.in)
+		sc.Buffer(make([]byte, 0, 64<<10), 4<<20) // pasted text can exceed the 64KB default
 		for sc.Scan() {
 			select {
 			case lines <- sc.Text():
@@ -84,43 +101,37 @@ func (t *Terminal) Run(ctx context.Context, a *agent.Agent) error {
 		readErr <- sc.Err()
 	}()
 
+	t.mu.Lock()
+	t.write("> ")
+	t.mu.Unlock()
 	for {
-		t.prompt()
-		var line string
 		select {
 		case <-ctx.Done():
 			t.endLine()
 			return nil
 		case err := <-readErr:
-			t.endLine()
-			return err
-		case line = <-lines:
-			// The user's Enter already moved the cursor to a new line.
-			t.mu.Lock()
-			t.midLine = false
-			t.mu.Unlock()
-		}
-		line = strings.TrimSpace(line)
-		if line == "" {
-			continue
-		}
-		if err := a.Turn(ctx, line); err != nil {
-			if ctx.Err() != nil {
-				return nil
+			if err != nil {
+				return err
 			}
+			for !ss.Idle(ChatID) {
+				select {
+				case <-ctx.Done():
+					t.endLine()
+					return nil
+				case <-time.After(100 * time.Millisecond):
+				}
+			}
+			t.endLine()
+			return nil
+		case line := <-lines:
 			t.mu.Lock()
-			t.newline()
-			t.write("error: " + err.Error() + "\n")
+			t.midLine = false // the user's Enter already moved to a new line
 			t.mu.Unlock()
+			if line = strings.TrimSpace(line); line != "" {
+				ss.Send(ChatID, line)
+			}
 		}
 	}
-}
-
-func (t *Terminal) prompt() {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	t.newline()
-	t.write("> ")
 }
 
 // write and newline require t.mu.
@@ -136,6 +147,12 @@ func (t *Terminal) newline() {
 	if t.midLine {
 		t.write("\n")
 	}
+}
+
+func (t *Terminal) endLine() {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.newline()
 }
 
 // summarize renders a result as one short line: section labels like
@@ -156,10 +173,4 @@ func summarize(s string) string {
 		return fmt.Sprintf("%s (%d bytes)", line, len(s))
 	}
 	return line
-}
-
-func (t *Terminal) endLine() {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	t.newline()
 }

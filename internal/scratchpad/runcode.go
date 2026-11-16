@@ -18,14 +18,15 @@ func (p *Pad) Defs() []llm.ToolDef {
 		Name: "run_code",
 		Description: fmt.Sprintf(`Run JavaScript in your persistent scratchpad. This is how you use tools: they are async functions on the global `+"`tools`"+` object, declared below.
 
-- `+"`code`"+` runs as the body of an async function: use top-level await, and `+"`return`"+` a value to get it back (strings verbatim, anything else as JSON). console.log output is returned too.
-- State persists between calls only through globals: `+"`globalThis.data = ...`"+` (or a bare `+"`data = ...`"+`). const/let/function declarations are local to one call.
+- `+"`code`"+` runs as the body of an async function, so top-level await works. The value of the last line comes back to you (or use `+"`return`"+` explicitly): strings verbatim, anything else as JSON. console.log output is returned too.
+- State persists between calls only through globals: `+"`globalThis.results = ...`"+` (or a bare `+"`results = ...`"+`). const/let/function declarations are local to one call.
 - Run independent tool calls in parallel: `+"`await Promise.all([...])`"+`.
 - A failed tool call throws an Error; use try/catch to handle it.
 - Filter and summarize in code; return only what you need instead of large raw outputs.
-- A call that runs longer than %s is stopped and the scratchpad is reset, losing all state. Pass reset: true to clear state yourself.
+- A call still running after %s continues in the background as a job, and its result is sent to you automatically as a new message when it finishes. Do not wait, sleep, or re-run it: end your turn unless you have other independent work.
+- A call that runs longer than %s in total is stopped and the scratchpad is reset, losing all state. Pass reset: true to clear state yourself.
 
-`+"```ts\n%s```", p.opts.Timeout, Declarations(p.reg.All())),
+`+"```ts\n%s```", p.opts.Wait, p.opts.Timeout, Declarations(p.reg.All())),
 		Parameters: json.RawMessage(runCodeParams),
 	}}
 }
