@@ -33,6 +33,9 @@ func main() {
 }
 
 func run() error {
+	if ok, err := subcommand(os.Args[1:]); ok {
+		return err
+	}
 	home, _ := os.UserHomeDir()
 	baseURL := flag.String("base-url", cmp.Or(os.Getenv("OPENAI_BASE_URL"), openai.DefaultBaseURL), "OpenAI-compatible API base URL (env OPENAI_BASE_URL)")
 	model := flag.String("model", os.Getenv("OPENAI_MODEL"), "model name (env OPENAI_MODEL)")

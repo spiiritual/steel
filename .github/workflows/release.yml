@@ -1,0 +1,58 @@
+# Publishes a signed release when a version tag (v1.2.3) is pushed.
+#
+# Assets: one binary per platform (steel-<os>-<arch>), checksums.txt with
+# their SHA-256 sums, and checksums.txt.minisig, a minisign signature by the
+# release key whose public half is built into steel. `steel update` checks
+# the signature, then the checksum, before installing anything.
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write # create the release
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+
+      - name: Test
+        run: |
+          go vet ./...
+          go test -race ./...
+
+      - name: Build
+        env:
+          VERSION: ${{ github.ref_name }}
+        run: |
+          mkdir dist
+          for target in darwin/amd64 darwin/arm64 linux/amd64 linux/arm64; do
+            os=${target%/*} arch=${target#*/}
+            CGO_ENABLED=0 GOOS=$os GOARCH=$arch go build -trimpath \
+              -ldflags "-s -w -X main.version=$VERSION" \
+              -o "dist/steel-$os-$arch" ./cmd/steel
+          done
+          cd dist && sha256sum steel-* > checksums.txt
+
+      - name: Sign
+        env:
+          MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
+          VERSION: ${{ github.ref_name }}
+        run: |
+          sudo apt-get install -y minisign
+          key=$(mktemp)
+          printf '%s\n' "$MINISIGN_SECRET_KEY" > "$key"
+          minisign -S -s "$key" -m dist/checksums.txt -t "steel $VERSION"
+          rm -f "$key"
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ github.ref_name }}
+        run: gh release create "$VERSION" dist/* --title "$VERSION" --generate-notes
