@@ -17,8 +17,10 @@ import (
 	"github.com/spiiritual/steel/internal/channel/terminal"
 	"github.com/spiiritual/steel/internal/llm/openai"
 	"github.com/spiiritual/steel/internal/mcp"
+	"github.com/spiiritual/steel/internal/memory"
 	"github.com/spiiritual/steel/internal/scratchpad"
 	"github.com/spiiritual/steel/internal/tool"
+	"github.com/spiiritual/steel/internal/usage"
 )
 
 func main() {
@@ -102,7 +104,22 @@ func run() error {
 		fmt.Fprintln(os.Stderr, "steel:", w)
 	}
 
+	provider := openai.New(*o.baseURL, apiKey)
+	usageLog := usage.NewLog(usagePath(*o.configPath), func(err error) {
+		fmt.Fprintln(os.Stderr, "steel: recording usage:", err)
+	})
 	builtin := []tool.Tool{tool.ReadFile(cwd), tool.Bash(cwd)}
+	system := *o.system
+	var mem memory.Memory
+	if *o.memoryDir != "" {
+		opened, err := openMemory(o, usageLog.Track(provider, "compaction"))
+		if err != nil {
+			return err
+		}
+		defer opened.close() // after sessions.Close, so the last turns are logged
+		mem, system = opened.memory, opened.system
+		builtin = append(builtin, opened.tools...)
+	}
 	tools := tool.NewRegistry(withoutCollisions(builtin, servers.Tools())...)
 	// recent.json sits next to the config, so a test config elsewhere keeps
 	// its own history.
@@ -120,9 +137,10 @@ func run() error {
 		delete(guidance, namespace(t.Name))
 	}
 	sessions, err := agent.NewSessions(agent.Config{
-		Provider:    openai.New(*o.baseURL, apiKey),
+		Provider:    usageLog.Track(provider, "turn"),
 		Model:       *o.model,
-		System:      *o.system,
+		System:      system,
+		Memory:      mem,
 		NewToolbox:  func(h agent.Hooks) agent.Toolbox { return newPad(tools, guidance, *o.toolBudget, h) },
 		Dir:         *o.dataDir,
 		IdleTimeout: *o.idle,

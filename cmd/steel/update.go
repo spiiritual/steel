@@ -24,6 +24,8 @@ func subcommand(args []string) (bool, error) {
 		return true, runUpdate(args[1:])
 	case "rollback":
 		return true, runRollback()
+	case "usage":
+		return true, runUsage(args[1:], os.Stdout)
 	}
 	return false, nil
 }

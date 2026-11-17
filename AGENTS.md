@@ -19,6 +19,8 @@ steel is a personal agent harness in Go. It's used mainly through Telegram and t
 | `internal/scratchpad` | The goja JS runtime behind `run_code`: tool layout, disclosure, background jobs |
 | `internal/tool` | `Tool`, `Registry`, builtins, Go types → TypeScript, JSON Schema → TypeScript, recent-tools list |
 | `internal/mcp` | MCP client: standard `mcpServers` config, tool adaptation, server guidance |
+| `internal/memory` | The `Memory` interface sessions use: `Wake` opens each new conversation |
+| `internal/memory/optmem` | The memory: model-written notes, a summary tree, wake ([OptMem](https://github.com/VictorTaelin/OptMem)) |
 | `internal/datafile` | Versioned, atomic JSON files for all saved state |
 | `internal/update` | Signed-release check, download, verify, swap, rollback |
 
@@ -30,6 +32,8 @@ Don't undo these without discussing it first.
 - **Signatures come from the source of truth.** Go types (`tool.New`) for builtins, JSON Schema for MCP tools, rendered as inline TypeScript with no named types, so each signature stands alone.
 - **Progressive disclosure.** Namespaces get full declarations while they fit the budget; the rest are an index of name + short description. **No tool runs before the model has seen its full documentation**: calls to indexed tools are refused until a script result has carried their docs (`tools.$docs(...)` or a refused call). Docs travel in `Result.Docs`, never as values a script could hide.
 - **Plugins are standards, not Go.** Extending steel means MCP servers and config files (same `mcpServers` format as Claude Desktop/Claude Code). Never require users to write Go.
+- **Memory systems are swappable.** `agent` knows only `memory.Memory`; `cmd/steel/memory.go` maps the `memory-system` setting to an implementation, which brings its own system prompt and tools.
+- **OptMem: the model takes notes.** `tools.memory.note/recall/zoom/rewrite`. Each new conversation's history starts with its wake (saved with it, so cached until `/new`). Summaries are written in the background by `compact-model`, never by the turn model. Files stay byte-compatible with OptMem's `memo`, so a directory can be shared with it.
 - **Layers stay separate.** `agent` doesn't know about channels; channels don't know about the model or tools.
 
 ## Invariants

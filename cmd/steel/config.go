@@ -29,7 +29,8 @@ import (
 // config.json, which the flag overrides for one run.
 type options struct {
 	baseURL, model, system, configPath, dataDir *string
-	channel                                     *choice
+	memoryDir, compactModel                     *string
+	channel, memorySystem                       *choice
 	allowedUsers                                *idList
 	idle, drain                                 *time.Duration
 	toolBudget                                  *int
@@ -41,6 +42,7 @@ func defineFlags(fs *flag.FlagSet) *options {
 	o := &options{
 		channel:      &choice{value: "terminal", options: []string{"terminal", "telegram"}},
 		allowedUsers: &idList{},
+		memorySystem: &choice{value: "optmem", options: memorySystemNames()},
 	}
 	o.model = fs.String("model", "", summary("model"))
 	o.baseURL = fs.String("base-url", openai.DefaultBaseURL, summary("base-url"))
@@ -49,6 +51,9 @@ func defineFlags(fs *flag.FlagSet) *options {
 	fs.Var(o.allowedUsers, "telegram-allowed-users", summary("telegram-allowed-users"))
 	o.configPath = fs.String("config", defaultConfigPath(), `settings file, edited with "steel config"; secrets go in .env beside it`)
 	o.dataDir = fs.String("data", filepath.Join(home, ".steel", "sessions"), summary("data"))
+	o.memoryDir = fs.String("memory", filepath.Join(home, ".steel", "memory"), summary("memory"))
+	fs.Var(o.memorySystem, "memory-system", summary("memory-system"))
+	o.compactModel = fs.String("compact-model", "", summary("compact-model"))
 	o.idle = fs.Duration("idle", 30*time.Minute, summary("idle"))
 	o.toolBudget = fs.Int("tool-budget", 4000, summary("tool-budget"))
 	o.drain = fs.Duration("drain", time.Minute, summary("drain"))
@@ -97,6 +102,14 @@ Use the exact ID the provider expects, e.g. "gpt-4o-mini" for OpenAI or
 Example: steel config set model gpt-4o-mini`,
 	},
 	{
+		flag: "compact-model", path: []string{"compactModel"},
+		summary: "cheap model that writes memory's summaries",
+		details: `Memory summarizes the model's notes in pairs, and pairs of those, in
+the background: about one small call (under 5 KB) per note. Any model
+from the same base-url will do; a cheap one is plenty. Empty uses model.
+Example: steel config set compact-model gpt-4.1-nano`,
+	},
+	{
 		flag: "base-url", path: []string{"baseURL"}, env: "OPENAI_BASE_URL",
 		summary: "OpenAI-compatible API base URL",
 		details: `Any server that speaks the OpenAI chat completions API: OpenAI,
@@ -132,6 +145,24 @@ Example: steel config set telegram-allowed-users 123456789,987654321`,
 		details: `One JSON file per conversation, saved before every model call.
 Empty keeps history in memory only, lost when steel exits.
 Example: steel config set data ~/steel-history`,
+	},
+	{
+		flag: "memory", path: []string{"memory"},
+		summary: "directory of steel's memory, shared by every chat",
+		details: `The model notes what's worth keeping there, one line at a time, kept
+forever and summarized in the background (by compact-model). Every new
+conversation starts by reading it. Empty turns memory off.
+The format is OptMem's: point this at ~/.optmem/memory to share one memory
+with agents that use OptMem's memo tool.
+Example: steel config set memory ~/Sync/steel-memory`,
+	},
+	{
+		flag: "memory-system", path: []string{"memorySystem"},
+		summary: `how memory works: "optmem"`,
+		details: `optmem: the model notes what it learns; each conversation starts with
+its notes, recent ones whole and old ones summarized into a tree it can
+search and zoom (github.com/VictorTaelin/OptMem).
+Example: steel config set memory-system optmem`,
 	},
 	{
 		flag: "idle", path: []string{"idle"},

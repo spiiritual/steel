@@ -178,6 +178,9 @@ func (s *Session) turn(ctx context.Context, gen int) error {
 	if box != nil {
 		defs = box.Defs()
 	}
+	if err := s.wake(ctx, gen); err != nil {
+		return err
+	}
 
 	for {
 		msgs, ok := s.drain(gen)
@@ -368,4 +371,37 @@ func (s *Session) save() {
 	if err := datafile.Write(s.path(), historyVersion, h); err != nil {
 		s.emit(Notice{Text: "Couldn't save history: " + err.Error()})
 	}
+}
+
+// wake starts a new conversation with what the memory, if any, recalls.
+// The messages join the history, so they're saved with it and stay the
+// same, read from the prompt cache, until /new. A conversation is new
+// while its history has nothing but the system prompt; one whose wake
+// failed tries again next turn.
+func (s *Session) wake(ctx context.Context, gen int) error {
+	mem := s.cfg.Memory
+	if mem == nil {
+		return nil
+	}
+	s.mu.Lock()
+	started := slices.ContainsFunc(s.history, func(m llm.Message) bool { return m.Role != llm.RoleSystem })
+	s.mu.Unlock()
+	if started {
+		return nil
+	}
+	msgs, err := mem.Wake(ctx, s.id)
+	if err != nil {
+		// The input waits for the next turn, which tries again; left in
+		// the inbox, it would start one now, and fail again, forever.
+		s.mu.Lock()
+		s.notes, s.inbox = append(s.notes, s.inbox...), nil
+		s.mu.Unlock()
+		return fmt.Errorf("memory: %w", err)
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if gen == s.gen {
+		s.history = append(s.history, msgs...)
+	}
+	return nil
 }

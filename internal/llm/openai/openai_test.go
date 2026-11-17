@@ -237,3 +237,81 @@ func TestStreamTruncated(t *testing.T) {
 		t.Errorf("msg = %+v", msg)
 	}
 }
+
+func TestStreamReportsUsageWithCachedTokens(t *testing.T) {
+	tests := []struct{ name, usage string }{
+		{"openai", `{"prompt_tokens":2048,"completion_tokens":7,"prompt_tokens_details":{"cached_tokens":1920}}`},
+		{"deepseek", `{"prompt_tokens":2048,"completion_tokens":7,"prompt_cache_hit_tokens":1920,"prompt_cache_miss_tokens":128}`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var asked bool
+			h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				var req chatRequest
+				json.NewDecoder(r.Body).Decode(&req)
+				asked = req.StreamOptions != nil && req.StreamOptions.IncludeUsage
+				sse(`{"choices":[{"delta":{"content":"hi"},"finish_reason":"stop"}]}`,
+					`{"choices":[],"usage":`+tt.usage+`}`, "[DONE]")(w, r)
+			})
+			msg, err := stream(t, h, llm.Request{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !asked {
+				t.Error("request didn't ask for usage")
+			}
+			if msg.Usage == nil || *msg.Usage != (llm.Usage{Input: 2048, Cached: 1920, Output: 7}) {
+				t.Errorf("usage = %+v", msg.Usage)
+			}
+		})
+	}
+}
+
+func TestServerRejectingStreamOptionsStillWorks(t *testing.T) {
+	var withOptions, without int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req map[string]any
+		json.NewDecoder(r.Body).Decode(&req)
+		if _, ok := req["stream_options"]; ok {
+			withOptions++
+			w.WriteHeader(http.StatusBadRequest)
+			fmt.Fprint(w, `{"error":{"message":"Unrecognized request argument supplied: stream_options"}}`)
+			return
+		}
+		without++
+		sse(`{"choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}]}`)(w, r)
+	}))
+	defer srv.Close()
+	c := New(srv.URL, "")
+	for range 2 {
+		msg, err := c.Stream(context.Background(), llm.Request{Model: "m"}, func(string) error { return nil })
+		if err != nil || msg.Content != "ok" || msg.Usage != nil {
+			t.Fatalf("msg = %+v, err = %v", msg, err)
+		}
+	}
+	if withOptions != 1 || without != 2 {
+		t.Errorf("%d requests with stream_options, %d without; want 1 then none", withOptions, without)
+	}
+}
+
+func TestNoToolCallsSendsToolsWithChoiceNone(t *testing.T) {
+	var got map[string]json.RawMessage
+	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got = nil
+		json.NewDecoder(r.Body).Decode(&got)
+		sse(`{"choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}]}`)(w, r)
+	})
+	tools := []llm.ToolDef{{Name: "run_code", Parameters: json.RawMessage(`{"type":"object"}`)}}
+	if _, err := stream(t, h, llm.Request{Tools: tools, NoToolCalls: true}); err != nil {
+		t.Fatal(err)
+	}
+	if string(got["tool_choice"]) != `"none"` || len(got["tools"]) == 0 {
+		t.Errorf("tool_choice = %s, tools = %s", got["tool_choice"], got["tools"])
+	}
+	if _, err := stream(t, h, llm.Request{Tools: tools}); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := got["tool_choice"]; ok {
+		t.Errorf("tool_choice sent without NoToolCalls: %s", got["tool_choice"])
+	}
+}

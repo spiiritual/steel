@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/spiiritual/steel/internal/llm"
+	"github.com/spiiritual/steel/internal/memory"
 )
 
 // Event is something that happened in a session.
@@ -82,6 +83,9 @@ type Config struct {
 	NewToolbox func(Hooks) Toolbox
 	// Dir stores one history file per session; "" keeps history in memory.
 	Dir string
+	// Memory, if set, opens every new conversation with what it recalls.
+	// System should then include how to use it, and NewToolbox its tools.
+	Memory memory.Memory
 	// IdleTimeout closes the toolboxes of sessions idle this long, freeing
 	// their memory; 0 never closes them.
 	IdleTimeout time.Duration

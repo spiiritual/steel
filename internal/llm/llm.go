@@ -31,6 +31,15 @@ type Message struct {
 	ToolCalls []ToolCall `json:"tool_calls,omitempty"`
 	// ToolCallID links a RoleTool message to the call it answers.
 	ToolCallID string `json:"tool_call_id,omitempty"`
+	// Usage is what a reply cost, when the provider reports it. It isn't
+	// saved with history.
+	Usage *Usage `json:"-"`
+}
+
+// Usage counts a request's tokens. Cached is the part of Input the
+// provider read from its prompt cache.
+type Usage struct {
+	Input, Cached, Output int
 }
 
 // ToolCall is a model's request to run one tool.
@@ -55,6 +64,12 @@ type Request struct {
 	Model    string
 	Messages []Message
 	Tools    []ToolDef
+	// NoToolCalls sends Tools but forbids calling them, so a request can
+	// share a cached prefix with ones that may call tools.
+	NoToolCalls bool
+	// MaxTokens caps the reply's tokens, reasoning included; 0 leaves it
+	// to the provider. A reply cut by the cap comes with ErrTruncated.
+	MaxTokens int
 }
 
 // Provider generates completions from a model.
