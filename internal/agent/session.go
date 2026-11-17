@@ -7,13 +7,13 @@ import (
 	"fmt"
 	"io/fs"
 	"net/url"
-	"os"
 	"path/filepath"
 	"slices"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/spiiritual/steel/internal/datafile"
 	"github.com/spiiritual/steel/internal/llm"
 )
 
@@ -31,6 +31,9 @@ type Session struct {
 	emit func(Event)
 
 	saveMu sync.Mutex // serializes snapshot+write so the newest state wins
+	// keepFile is set when the saved history came from a newer steel: it
+	// isn't loaded, and isn't overwritten. Set before the session is used.
+	keepFile bool
 
 	mu       sync.Mutex
 	history  []llm.Message
@@ -181,6 +184,10 @@ func (s *Session) turn(ctx context.Context, gen int) error {
 		if !ok {
 			return nil
 		}
+		// Save before every model call: history is valid here (each tool
+		// call has its result), and a kill that can't be caught, like a
+		// supervisor's after its stop timeout, then loses at most one step.
+		s.save()
 		reply, err := s.cfg.Provider.Stream(ctx, llm.Request{Model: s.cfg.Model, Messages: msgs, Tools: defs}, func(d string) error {
 			s.emit(TextDelta{Text: d})
 			return nil
@@ -318,20 +325,25 @@ func (s *Session) path() string {
 	return filepath.Join(s.cfg.Dir, url.PathEscape(s.id)+".json")
 }
 
+// historyVersion is the format version of saved history files; bump it,
+// and migrate in load, when the format changes.
+const historyVersion = 1
+
 // load reads saved history, replacing its system prompt with the current one.
 func (s *Session) load() []llm.Message {
 	if s.cfg.Dir == "" {
 		return s.fresh()
 	}
-	b, err := os.ReadFile(s.path())
-	if errors.Is(err, fs.ErrNotExist) {
-		return s.fresh()
-	}
 	var h []llm.Message
-	if err == nil {
-		err = json.Unmarshal(b, &h)
-	}
-	if err != nil {
+	_, err := datafile.Read(s.path(), historyVersion, &h)
+	switch {
+	case errors.Is(err, fs.ErrNotExist):
+		return s.fresh()
+	case errors.Is(err, datafile.ErrNewer):
+		s.keepFile = true
+		s.emit(Notice{Text: fmt.Sprintf("Saved history was written by a newer steel (%v); starting fresh without saving, so it isn't overwritten.", err)})
+		return s.fresh()
+	case err != nil:
 		s.emit(Notice{Text: fmt.Sprintf("Couldn't load saved history (%v); starting fresh.", err)})
 		return s.fresh()
 	}
@@ -345,37 +357,15 @@ func (s *Session) load() []llm.Message {
 // history after acquiring saveMu, so the last save always writes the newest
 // state.
 func (s *Session) save() {
-	if s.cfg.Dir == "" {
+	if s.cfg.Dir == "" || s.keepFile {
 		return
 	}
 	s.saveMu.Lock()
 	defer s.saveMu.Unlock()
 	s.mu.Lock()
-	b, err := json.Marshal(s.history)
+	h := slices.Clone(s.history)
 	s.mu.Unlock()
-	if err == nil {
-		err = writeAtomic(s.path(), b)
-	}
-	if err != nil {
+	if err := datafile.Write(s.path(), historyVersion, h); err != nil {
 		s.emit(Notice{Text: "Couldn't save history: " + err.Error()})
 	}
-}
-
-// writeAtomic writes b to path via a unique temp file and rename.
-func writeAtomic(path string, b []byte) error {
-	f, err := os.CreateTemp(filepath.Dir(path), filepath.Base(path)+".*.tmp")
-	if err != nil {
-		return err
-	}
-	_, werr := f.Write(b)
-	cerr := f.Close()
-	if err := errors.Join(werr, cerr); err != nil {
-		os.Remove(f.Name())
-		return err
-	}
-	if err := os.Rename(f.Name(), path); err != nil {
-		os.Remove(f.Name())
-		return err
-	}
-	return nil
 }

@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"context"
 	"maps"
 	"os"
 	"slices"
@@ -13,6 +14,12 @@ import (
 type Sessions struct {
 	cfg  Config
 	emit func(id string, e Event)
+
+	// inputMu orders user input against Drain: Send holds it shared from
+	// checking draining until the session has the input, so once Drain
+	// holds it exclusively and sets draining, no input slips past.
+	inputMu  sync.RWMutex
+	draining bool // Drain started: user input is ignored
 
 	mu        sync.Mutex
 	m         map[string]*Session
@@ -36,8 +43,14 @@ func NewSessions(cfg Config, emit func(id string, e Event)) (*Sessions, error) {
 	return ss, nil
 }
 
-// Send routes text from chat id to its session. After Close it does nothing.
+// Send routes text from chat id to its session. After Drain or Close it
+// does nothing.
 func (ss *Sessions) Send(id, text string) {
+	ss.inputMu.RLock()
+	defer ss.inputMu.RUnlock()
+	if ss.draining {
+		return
+	}
 	if s := ss.get(id); s != nil {
 		s.Send(text)
 	}
@@ -89,6 +102,31 @@ func (ss *Sessions) janitor() {
 			for _, s := range all {
 				s.evictIfIdle(ss.cfg.IdleTimeout)
 			}
+		}
+	}
+}
+
+// Drain prepares for shutdown: it stops taking user input and waits until
+// every session is idle, with no running turn, queued input, or background
+// work. Background results still reach the model meanwhile. If ctx ends
+// first it returns ctx's error; Close then cancels whatever is left.
+func (ss *Sessions) Drain(ctx context.Context) error {
+	ss.inputMu.Lock()
+	ss.draining = true
+	ss.inputMu.Unlock()
+	t := time.NewTicker(50 * time.Millisecond)
+	defer t.Stop()
+	for {
+		ss.mu.Lock()
+		ids := slices.Collect(maps.Keys(ss.m))
+		ss.mu.Unlock()
+		if !slices.ContainsFunc(ids, func(id string) bool { return !ss.Idle(id) }) {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-t.C:
 		}
 	}
 }

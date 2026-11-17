@@ -1,14 +1,16 @@
 package tool
 
 import (
-	"encoding/json"
 	"errors"
 	"io/fs"
-	"os"
-	"path/filepath"
 	"slices"
 	"sync"
+
+	"github.com/spiiritual/steel/internal/datafile"
 )
+
+// recentVersion is the format version of the saved list.
+const recentVersion = 1
 
 // maxRecent caps how many tools Recent remembers.
 const maxRecent = 100
@@ -25,35 +27,28 @@ type Recent struct {
 	mu        sync.Mutex
 	names     []string // most recent first
 	reported  bool     // a save error went to onSaveErr already
+	keepFile  bool     // the file is from a newer steel: don't overwrite it
 }
 
 // LoadRecent reads the list saved at path. A missing file is an empty list;
 // an unreadable or corrupt one is also empty, with the error, so callers can
-// warn and carry on. onSaveErr, if set, receives the first error saving the
-// list; later ones are dropped, since they'd likely repeat it.
+// warn and carry on. A file from a newer steel is never overwritten; the
+// list then lives in memory only. onSaveErr, if set, receives the first
+// error saving the list; later ones are dropped, since they'd likely repeat
+// it.
 func LoadRecent(path string, onSaveErr func(error)) (*Recent, error) {
 	r := &Recent{path: path, onSaveErr: onSaveErr}
-	names, err := readNames(path)
-	if errors.Is(err, fs.ErrNotExist) {
+	_, err := datafile.Read(path, recentVersion, &r.names)
+	switch {
+	case errors.Is(err, fs.ErrNotExist):
 		return r, nil
+	case errors.Is(err, datafile.ErrNewer):
+		r.keepFile = true
 	}
 	if err != nil {
-		return r, err
+		r.names = nil
 	}
-	r.names = names
-	return r, nil
-}
-
-func readNames(path string) ([]string, error) {
-	b, err := os.ReadFile(path)
-	if err != nil {
-		return nil, err
-	}
-	var names []string
-	if err := json.Unmarshal(b, &names); err != nil {
-		return nil, err
-	}
-	return names, nil
+	return r, err
 }
 
 // Names returns the remembered tool names, most recently used first.
@@ -68,8 +63,11 @@ func (r *Recent) Use(name string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	// Start from the saved list, which another process may have updated.
-	if saved, err := readNames(r.path); err == nil {
+	var saved []string
+	if _, err := datafile.Read(r.path, recentVersion, &saved); err == nil {
 		r.names = saved
+	} else if errors.Is(err, datafile.ErrNewer) {
+		r.keepFile = true
 	}
 	if len(r.names) > 0 && r.names[0] == name {
 		return // already first: nothing to save
@@ -79,33 +77,11 @@ func (r *Recent) Use(name string) {
 	if len(r.names) > maxRecent {
 		r.names = r.names[:maxRecent]
 	}
-	if err := r.save(); err != nil && r.onSaveErr != nil && !r.reported {
+	if r.keepFile {
+		return
+	}
+	if err := datafile.Write(r.path, recentVersion, r.names); err != nil && r.onSaveErr != nil && !r.reported {
 		r.reported = true
 		r.onSaveErr(err)
 	}
-}
-
-// save writes the list atomically: a crash mid-write leaves the old file.
-func (r *Recent) save() error {
-	b, err := json.Marshal(r.names)
-	if err != nil {
-		return err
-	}
-	dir := filepath.Dir(r.path)
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return err
-	}
-	tmp, err := os.CreateTemp(dir, ".recent-*")
-	if err != nil {
-		return err
-	}
-	defer os.Remove(tmp.Name()) // no-op after a successful rename
-	if _, err := tmp.Write(b); err != nil {
-		tmp.Close()
-		return err
-	}
-	if err := tmp.Close(); err != nil {
-		return err
-	}
-	return os.Rename(tmp.Name(), r.path)
 }

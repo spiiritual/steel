@@ -8,6 +8,8 @@ import (
 	"path/filepath"
 	"slices"
 	"testing"
+
+	"github.com/spiiritual/steel/internal/datafile"
 )
 
 func TestRegistryRemembersRecentToolsAcrossRestarts(t *testing.T) {
@@ -49,5 +51,19 @@ func TestRegistryRemembersRecentToolsAcrossRestarts(t *testing.T) {
 	os.WriteFile(path, []byte("{"), 0o600)
 	if rec3, err := LoadRecent(path, nil); err == nil || len(rec3.Names()) != 0 {
 		t.Errorf("corrupt file: %q, %v", rec3.Names(), err)
+	}
+}
+
+func TestRecentLeavesNewerFileAlone(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "recent.json")
+	newer := `{"version":99,"data":{"tools":["x"]}}`
+	os.WriteFile(path, []byte(newer), 0o600)
+	rec, err := LoadRecent(path, func(err error) { t.Error(err) })
+	if !errors.Is(err, datafile.ErrNewer) {
+		t.Fatalf("LoadRecent err = %v", err)
+	}
+	rec.Use("a.x") // remembered in memory only
+	if b, _ := os.ReadFile(path); string(b) != newer || !slices.Equal(rec.Names(), []string{"a.x"}) {
+		t.Errorf("file = %s, names = %q", b, rec.Names())
 	}
 }

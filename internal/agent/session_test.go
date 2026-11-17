@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/spiiritual/steel/internal/datafile"
 	"github.com/spiiritual/steel/internal/llm"
 )
 
@@ -338,6 +339,10 @@ func TestCloseWaitsForTurnAndSaves(t *testing.T) {
 	})
 	h.ss.Send("c", "in flight")
 	<-started
+	// Already saved while the turn runs, in case shutdown can't wait for it.
+	if b, err := os.ReadFile(filepath.Join(dir, "c.json")); err != nil || !strings.Contains(string(b), "in flight") {
+		t.Errorf("mid-turn save = %s, err = %v", b, err)
+	}
 	h.ss.Close()
 
 	// The cancelled turn's save completed before Close returned.
@@ -364,12 +369,87 @@ func TestConcurrentSavesKeepFileValid(t *testing.T) {
 	}
 	wg.Wait()
 	var got []llm.Message
-	b, _ := os.ReadFile(filepath.Join(dir, "c.json"))
-	if err := json.Unmarshal(b, &got); err != nil || len(got) != 51 {
+	if _, err := datafile.Read(filepath.Join(dir, "c.json"), historyVersion, &got); err != nil || len(got) != 51 {
 		t.Errorf("final file has %d messages, err = %v", len(got), err)
 	}
 	if entries, _ := os.ReadDir(dir); len(entries) != 1 {
 		t.Errorf("leftover temp files: %d entries", len(entries))
+	}
+}
+
+func TestDrainLetsRunningTurnFinishAndIgnoresNewInput(t *testing.T) {
+	release := make(chan struct{})
+	h := newHarness(t, Config{}, func(i int, ctx context.Context, _ llm.Request) (llm.Message, error) {
+		if i == 0 {
+			select {
+			case <-release:
+			case <-ctx.Done():
+				return llm.Message{}, ctx.Err()
+			}
+		}
+		return text("done"), nil
+	})
+	h.ss.Send("c", "work")
+	waitFor(t, func() bool { return !h.ss.Idle("c") })
+
+	drained := make(chan error, 1)
+	go func() { drained <- h.ss.Drain(context.Background()) }()
+	waitFor(t, func() bool { h.ss.inputMu.RLock(); defer h.ss.inputMu.RUnlock(); return h.ss.draining })
+	h.ss.Send("c", "ignored")
+	select {
+	case err := <-drained:
+		t.Fatalf("Drain returned with a turn running: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(release)
+	if err := <-drained; err != nil {
+		t.Fatal(err)
+	}
+	// The turn finished normally rather than being cancelled, and input
+	// sent while draining started nothing.
+	if d := h.waitTurn(); d.Err != nil {
+		t.Errorf("turn err = %v", d.Err)
+	}
+	h.llm.mu.Lock()
+	n := len(h.llm.reqs)
+	h.llm.mu.Unlock()
+	if n != 1 {
+		t.Errorf("model requests = %d, want 1", n)
+	}
+}
+
+func TestDrainGivesUpAtDeadline(t *testing.T) {
+	h := newHarness(t, Config{}, func(_ int, ctx context.Context, _ llm.Request) (llm.Message, error) {
+		<-ctx.Done()
+		return llm.Message{}, ctx.Err()
+	})
+	h.ss.Send("c", "stuck")
+	waitFor(t, func() bool { return !h.ss.Idle("c") })
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	if err := h.ss.Drain(ctx); !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("Drain = %v, want deadline exceeded", err)
+	}
+}
+
+func TestHistoryFromNewerSteelIsLeftAlone(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "c.json")
+	newer := `{"version":99,"data":{"something":"new"}}`
+	os.WriteFile(path, []byte(newer), 0o600)
+	var notices []string
+	s := newSession("c", &Config{Dir: dir}, func(e Event) {
+		if n, ok := e.(Notice); ok {
+			notices = append(notices, n.Text)
+		}
+	})
+	s.history = append(s.history, llm.Message{Role: llm.RoleUser, Content: "hi"})
+	s.save()
+	if b, _ := os.ReadFile(path); string(b) != newer {
+		t.Errorf("newer file overwritten: %s", b)
+	}
+	if len(notices) != 1 || !strings.Contains(notices[0], "newer steel") {
+		t.Errorf("notices = %q", notices)
 	}
 }
 
