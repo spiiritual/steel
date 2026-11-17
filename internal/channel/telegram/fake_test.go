@@ -198,10 +198,12 @@ func textUpdate(id, from, chat int64, text string) map[string]any {
 	}}
 }
 
+// stopUpdate is a stop-button press. draft_id is a string, as real Telegram
+// sends it, though the docs say Integer.
 func stopUpdate(id, chat, draft int64) map[string]any {
 	return map[string]any{"update_id": id, "stopped_message_generation": map[string]any{
 		"chat":     map[string]any{"id": chat, "type": "private"},
-		"draft_id": draft,
+		"draft_id": fmt.Sprint(draft),
 	}}
 }
 

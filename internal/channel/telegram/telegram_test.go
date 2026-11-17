@@ -49,6 +49,20 @@ func TestPollingHandsUpdatesInOrderAndConfirmsThem(t *testing.T) {
 	}
 }
 
+func TestUnreadableUpdateIsSkipped(t *testing.T) {
+	f := newFakeAPI(t)
+	b, log, _ := testBot(t, f, 42)
+	ss := &fakeSessions{}
+	bad := textUpdate(5, 42, 42, "x")
+	bad["message"] = "not an object" // a shape steel can't decode
+	f.add(bad, textUpdate(6, 42, 42, "after"))
+	start(t, b, ss)
+	eventually(t, "both confirmed", func() bool { return lastOffset(f) == 7 })
+	if want := []string{"telegram:42: after"}; !slices.Equal(ss.got(), want) || !strings.Contains(log.String(), "skipping update 5") {
+		t.Errorf("handed %q, log %q", ss.got(), log.String())
+	}
+}
+
 func TestCancelLeavesUnhandedUpdatesUnconfirmed(t *testing.T) {
 	f := newFakeAPI(t)
 	b, _, _ := testBot(t, f, 42)

@@ -43,9 +43,22 @@ type (
 	// stop button of a draft sent with can_stop.
 	generationStopped struct {
 		Chat    chatRef `json:"chat"`
-		DraftID int64   `json:"draft_id"`
+		DraftID flexInt `json:"draft_id"`
 	}
 )
+
+// flexInt is an integer Telegram may send as a JSON number or a string:
+// draft_id is documented as Integer but arrives as "123".
+type flexInt int64
+
+func (n *flexInt) UnmarshalJSON(b []byte) error {
+	var v int64
+	if err := json.Unmarshal(bytes.Trim(b, `"`), &v); err != nil {
+		return err
+	}
+	*n = flexInt(v)
+	return nil
+}
 
 // Method parameters.
 type (

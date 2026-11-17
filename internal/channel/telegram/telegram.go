@@ -5,6 +5,7 @@ package telegram
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -141,12 +142,14 @@ func (b *Bot) run(ctx context.Context, ss sender) error {
 	var offset, acked int64
 	err := func() error {
 		for ctx.Err() == nil {
-			var ups []update
+			// Decoded one by one below, so an update steel can't read is
+			// skipped instead of blocking every update behind it.
+			var raw []json.RawMessage
 			err := b.api.callRetry(ctx, "getUpdates", getUpdatesParams{
 				Offset:         offset,
 				Timeout:        int(b.pollTimeout / time.Second),
 				AllowedUpdates: []string{"message", "stopped_message_generation"},
-			}, &ups, b.pollTimeout+15*time.Second, 0)
+			}, &raw, b.pollTimeout+15*time.Second, 0)
 			if ctx.Err() != nil {
 				return nil
 			}
@@ -154,9 +157,21 @@ func (b *Bot) run(ctx context.Context, ss sender) error {
 				return err
 			}
 			acked = offset
-			for _, u := range ups {
+			for _, r := range raw {
 				if ctx.Err() != nil {
 					return nil
+				}
+				var u update
+				if err := json.Unmarshal(r, &u); err != nil {
+					var id struct {
+						UpdateID int64 `json:"update_id"`
+					}
+					if json.Unmarshal(r, &id) != nil || id.UpdateID == 0 {
+						return fmt.Errorf("getUpdates: update without update_id: %.200s", r)
+					}
+					b.logf("skipping update %d: %v", id.UpdateID, err)
+					offset = id.UpdateID + 1
+					continue
 				}
 				b.handle(ss, me.Username, u)
 				offset = u.UpdateID + 1
