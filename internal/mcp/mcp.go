@@ -49,7 +49,7 @@ type server struct {
 // Connect connects to all servers concurrently. A server that fails is
 // skipped; it and any individual tools that couldn't be adapted are reported
 // in the returned warnings. The client is usable with whatever connected.
-func Connect(ctx context.Context, servers map[string]ServerConfig) (*Client, []error) {
+func Connect(ctx context.Context, servers map[string]ServerConfig, lookup Lookup) (*Client, []error) {
 	var (
 		mu       sync.Mutex
 		wg       sync.WaitGroup
@@ -58,7 +58,7 @@ func Connect(ctx context.Context, servers map[string]ServerConfig) (*Client, []e
 	)
 	for _, name := range slices.Sorted(maps.Keys(servers)) {
 		wg.Go(func() {
-			s, warn, err := dial(ctx, name, servers[name])
+			s, warn, err := dial(ctx, name, servers[name], lookup)
 			mu.Lock()
 			defer mu.Unlock()
 			for _, w := range warn {
@@ -78,8 +78,8 @@ func Connect(ctx context.Context, servers map[string]ServerConfig) (*Client, []e
 }
 
 // dial builds the transport for cfg and connects.
-func dial(ctx context.Context, name string, cfg ServerConfig) (*server, []error, error) {
-	cfg, err := cfg.expanded()
+func dial(ctx context.Context, name string, cfg ServerConfig, lookup Lookup) (*server, []error, error) {
+	cfg, err := cfg.expanded(lookup)
 	if err != nil {
 		return nil, nil, err
 	}

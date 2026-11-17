@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -29,7 +30,7 @@ func TestSSEStaysConnectedAfterConnect(t *testing.T) {
 	hs := httptest.NewServer(sdk.NewSSEHandler(func(*http.Request) *sdk.Server { return srv }, nil))
 	defer hs.Close()
 
-	s, _, err := dial(context.Background(), "s", ServerConfig{Type: "sse", URL: hs.URL})
+	s, _, err := dial(context.Background(), "s", ServerConfig{Type: "sse", URL: hs.URL}, os.LookupEnv)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -77,15 +78,15 @@ func TestExpandVars(t *testing.T) {
 		"${STEEL_T_EMPTY:-https://a.example}/": "https://a.example/",
 		"tok$en and $HOME":                     "tok$en and $HOME",
 	} {
-		if got, err := expandVars(in); err != nil || got != want {
+		if got, err := expandVars(in, os.LookupEnv); err != nil || got != want {
 			t.Errorf("expandVars(%q) = %q, %v; want %q", in, got, err, want)
 		}
 	}
-	if _, err := expandVars("${STEEL_T_UNSET}"); err == nil || !strings.Contains(err.Error(), "STEEL_T_UNSET is not set") {
+	if _, err := expandVars("${STEEL_T_UNSET}", os.LookupEnv); err == nil || !strings.Contains(err.Error(), "STEEL_T_UNSET is not set") {
 		t.Errorf("unset var err = %v", err)
 	}
 	cfg, err := ServerConfig{Command: "${STEEL_T_KEY}", Args: []string{"--k=${STEEL_T_KEY}"}, Env: map[string]string{"T": "${STEEL_T_KEY}"},
-		URL: "https://${STEEL_T_KEY}.example", Headers: map[string]string{"X": "${STEEL_T_KEY}"}}.expanded()
+		URL: "https://${STEEL_T_KEY}.example", Headers: map[string]string{"X": "${STEEL_T_KEY}"}}.expanded(os.LookupEnv)
 	if err != nil || cfg.Command != "k1" || cfg.Args[0] != "--k=k1" || cfg.Env["T"] != "k1" || cfg.URL != "https://k1.example" || cfg.Headers["X"] != "k1" {
 		t.Errorf("expanded = %+v, %v", cfg, err)
 	}

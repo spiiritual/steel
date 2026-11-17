@@ -5,14 +5,14 @@ steel is a personal agent harness in Go. It's used mainly through Telegram and t
 ## Commands
 
 - Before every commit: `gofmt -l .` (no output), `go vet ./...`, `go test -race ./...`.
-- Run: `go run ./cmd/steel -model <model> [-base-url ...] [-channel telegram]` (see `-help`).
+- Run: `go run ./cmd/steel config set model <model>` once (`steel config` lists every setting), then `go run ./cmd/steel`. Flags override saved settings for one run (see `-help`).
 - Release: `git tag -a vX.Y.Z -m "steel vX.Y.Z" && git push origin vX.Y.Z`. CI tests, builds, signs and publishes; never upload release assets by hand.
 
 ## Layout
 
 | Path | What it is |
 |---|---|
-| `cmd/steel` | Wiring, flags, config file, `update`/`rollback` subcommands |
+| `cmd/steel` | Wiring, flags, `config`/`update`/`rollback` subcommands |
 | `internal/agent` | Sessions: inbox, turns, history, events. Knows nothing about channels |
 | `internal/channel/{terminal,telegram}` | Channels: send user text into `agent.Sessions`, render `agent.Event`s |
 | `internal/llm`, `internal/llm/openai` | Provider interface and the OpenAI-compatible streaming client |
@@ -35,7 +35,7 @@ Don't undo these without discussing it first.
 ## Invariants
 
 - **Saved state** goes through `internal/datafile`. When a format changes, bump its version and migrate on load. Never overwrite a file written by a newer version.
-- **Secrets** come from environment variables, never config files, logs or error messages. Tokens steel itself uses are removed from the environment after reading so tools can't see them. The repo is public: never commit secrets.
+- **Secrets** come from environment variables or `~/.steel/.env` (written 0600 by `steel config set`), never `config.json`, logs or error messages. `.env` values are looked up by steel, never exported to its environment, and tokens steel itself uses are removed from the environment after reading, so tools can't see them. The repo is public: never commit secrets.
 - **Access control fails closed.** An empty Telegram allowlist means nobody.
 - **Shutdown.** SIGTERM drains (stop input, let work finish, bounded by `-drain`); Ctrl-C or a second SIGTERM quits now. History is saved before every model call.
 - **Releases** are verified against `update.ReleaseKey`; a signature's trusted comment must be `steel <tag>`. Changing the key strands every installed copy.

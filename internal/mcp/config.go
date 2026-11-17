@@ -8,7 +8,8 @@ import (
 
 // ServerConfig is one entry of the standard "mcpServers" config block, as
 // used by Claude Desktop, Claude Code, and Cursor. Every string field
-// supports ${VAR} and ${VAR:-default} expansion from steel's environment.
+// supports ${VAR} and ${VAR:-default} expansion from the lookup passed to
+// Connect.
 type ServerConfig struct {
 	// Type is "stdio", "http", or "sse". Empty means stdio when Command is
 	// set and http when URL is set.
@@ -21,14 +22,14 @@ type ServerConfig struct {
 }
 
 // expanded returns cfg with ${VAR} references expanded in every field.
-func (cfg ServerConfig) expanded() (ServerConfig, error) {
+func (cfg ServerConfig) expanded(lookup Lookup) (ServerConfig, error) {
 	var err error
 	ex := func(s string) string {
 		if err != nil {
 			return s
 		}
 		var out string
-		out, err = expandVars(s)
+		out, err = expandVars(s, lookup)
 		return out
 	}
 	out := ServerConfig{Type: cfg.Type, Command: ex(cfg.Command), URL: ex(cfg.URL)}
@@ -50,10 +51,13 @@ func (cfg ServerConfig) expanded() (ServerConfig, error) {
 	return out, err
 }
 
+// Lookup finds a variable for ${VAR} expansion, like os.LookupEnv.
+type Lookup func(name string) (string, bool)
+
 // expandVars expands ${VAR} and ${VAR:-default}, as Claude Code does. Any
 // other "$" is literal, so tokens like "tok$en" survive. A ${VAR} that is
 // unset and has no default is an error rather than a silent empty string.
-func expandVars(s string) (string, error) {
+func expandVars(s string, lookup Lookup) (string, error) {
 	var b strings.Builder
 	for {
 		i := strings.Index(s, "${")
@@ -69,7 +73,7 @@ func expandVars(s string) (string, error) {
 		b.WriteString(s[:i])
 		expr := s[i+2 : i+end]
 		name, def, hasDef := strings.Cut(expr, ":-")
-		val, set := os.LookupEnv(name)
+		val, set := lookup(name)
 		switch {
 		case hasDef && val == "":
 			val = def

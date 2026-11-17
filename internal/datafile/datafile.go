@@ -54,11 +54,18 @@ func Write(path string, version int, v any) error {
 	if err != nil {
 		return err
 	}
+	return WriteFile(path, b)
+}
+
+// WriteFile saves b at path atomically, readable only by its owner: a crash
+// mid-write leaves the previous file. The directory is created if needed.
+// It's for files like config.json that keep their own plain format.
+func WriteFile(path string, b []byte) error {
 	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return err
 	}
-	f, err := os.CreateTemp(dir, filepath.Base(path)+".*.tmp")
+	f, err := os.CreateTemp(dir, filepath.Base(path)+".*.tmp") // mode 0600
 	if err != nil {
 		return err
 	}

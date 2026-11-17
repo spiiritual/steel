@@ -2,19 +2,15 @@
 package main
 
 import (
-	"cmp"
 	"context"
-	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
-	"io/fs"
 	"os"
 	"os/signal"
 	"path/filepath"
 	"strings"
 	"syscall"
-	"time"
 
 	"github.com/spiiritual/steel/internal/agent"
 	"github.com/spiiritual/steel/internal/channel/telegram"
@@ -36,31 +32,41 @@ func run() error {
 	if ok, err := subcommand(os.Args[1:]); ok {
 		return err
 	}
-	home, _ := os.UserHomeDir()
-	baseURL := flag.String("base-url", cmp.Or(os.Getenv("OPENAI_BASE_URL"), openai.DefaultBaseURL), "OpenAI-compatible API base URL (env OPENAI_BASE_URL)")
-	model := flag.String("model", os.Getenv("OPENAI_MODEL"), "model name (env OPENAI_MODEL)")
-	system := flag.String("system", "", "system prompt")
-	configPath := flag.String("config", filepath.Join(home, ".steel", "config.json"), `config file; its "mcpServers" block uses the same format as Claude Desktop and Claude Code`)
-	dataDir := flag.String("data", filepath.Join(home, ".steel", "sessions"), "directory for saved conversation history")
-	idle := flag.Duration("idle", 30*time.Minute, "close a session's scratchpad after this much inactivity")
-	toolBudget := flag.Int("tool-budget", 4000, "approximate tokens of full tool declarations shown to the model; namespaces beyond it get one line per tool, documented on first use (0 = index every namespace, negative = no limit)")
-	drain := flag.Duration("drain", time.Minute, "on SIGTERM, how long to let running turns and background jobs finish before exiting; keep it under your service manager's stop timeout")
-	showVersion := flag.Bool("version", false, "print the version and exit")
-	channelName := flag.String("channel", "terminal", `where to chat: "terminal", or "telegram" (bot token in env TELEGRAM_BOT_TOKEN; allowed user IDs in the config's "telegram": {"allowedUsers": [...]})`)
+	o := defineFlags(flag.CommandLine)
 	flag.Parse()
-	if *showVersion {
+	if *o.showVersion {
 		fmt.Println("steel", versionString())
 		return nil
 	}
 	fmt.Fprintln(os.Stderr, "steel", versionString())
 
-	cfg, err := loadConfig(*configPath)
+	cfg, err := readConfig(*o.configPath)
 	if err != nil {
 		return err
 	}
+	env, err := loadEnvironment(*o.configPath)
+	if err != nil {
+		return err
+	}
+	if err := applyConfig(flag.CommandLine, cfg, env); err != nil {
+		return err
+	}
+	mcpServers, err := cfg.mcpServers()
+	if err != nil {
+		return err
+	}
+	// Trimmed, since token files often end in a newline. Removed from the
+	// environment so tools (shell.bash) can't read them; env keeps a copy
+	// for mcpServers expansion.
+	apiKey, _ := env.lookup("OPENAI_API_KEY")
+	token, _ := env.lookup("TELEGRAM_BOT_TOKEN")
+	apiKey, token = strings.TrimSpace(apiKey), strings.TrimSpace(token)
+	for _, s := range secrets {
+		os.Unsetenv(s.env)
+	}
 
-	if *model == "" {
-		return errors.New("no model: pass -model or set OPENAI_MODEL")
+	if *o.model == "" {
+		return errors.New("no model: run `steel config set model <name>`")
 	}
 
 	cwd, err := os.Getwd()
@@ -72,22 +78,15 @@ func run() error {
 		Emit(id string, e agent.Event)
 		Run(ctx context.Context, ss *agent.Sessions) error
 	}
-	switch *channelName {
-	case "terminal":
-		ch = terminal.New(os.Stdin, os.Stdout)
-	case "telegram":
-		// Trimmed, since token files often end in a newline. Removed from
-		// the environment so tools (shell.bash) can't read it.
-		token := strings.TrimSpace(os.Getenv("TELEGRAM_BOT_TOKEN"))
-		os.Unsetenv("TELEGRAM_BOT_TOKEN")
+	if o.channel.value == "telegram" {
 		if token == "" {
-			return errors.New("-channel telegram needs the bot token in TELEGRAM_BOT_TOKEN")
+			return errors.New("the telegram channel needs a bot token: run `steel config set telegram-bot-token`")
 		}
-		bot := telegram.New(telegram.Options{Token: token, AllowedUsers: cfg.Telegram.AllowedUsers})
+		bot := telegram.New(telegram.Options{Token: token, AllowedUsers: *o.allowedUsers})
 		defer bot.Close() // runs after sessions.Close, so their last messages go out
 		ch = bot
-	default:
-		return fmt.Errorf("unknown -channel %q: want terminal or telegram", *channelName)
+	} else {
+		ch = terminal.New(os.Stdin, os.Stdout)
 	}
 
 	// Ctrl-C quits now, cancelling running work. SIGTERM, which service
@@ -97,7 +96,7 @@ func run() error {
 	runCtx, stopRun := signal.NotifyContext(ctx, syscall.SIGTERM)
 	defer stopRun()
 
-	servers, warnings := mcp.Connect(runCtx, cfg.MCPServers) // either signal interrupts a slow server
+	servers, warnings := mcp.Connect(runCtx, mcpServers, env.lookup) // either signal interrupts a slow server
 	defer servers.Close()
 	for _, w := range warnings {
 		fmt.Fprintln(os.Stderr, "steel:", w)
@@ -107,7 +106,7 @@ func run() error {
 	tools := tool.NewRegistry(withoutCollisions(builtin, servers.Tools())...)
 	// recent.json sits next to the config, so a test config elsewhere keeps
 	// its own history.
-	recent, err := tool.LoadRecent(filepath.Join(filepath.Dir(*configPath), "recent.json"), func(err error) {
+	recent, err := tool.LoadRecent(filepath.Join(filepath.Dir(*o.configPath), "recent.json"), func(err error) {
 		fmt.Fprintln(os.Stderr, "steel: saving recently used tools:", err)
 	})
 	if err != nil {
@@ -121,12 +120,12 @@ func run() error {
 		delete(guidance, namespace(t.Name))
 	}
 	sessions, err := agent.NewSessions(agent.Config{
-		Provider:    openai.New(*baseURL, os.Getenv("OPENAI_API_KEY")),
-		Model:       *model,
-		System:      *system,
-		NewToolbox:  func(h agent.Hooks) agent.Toolbox { return newPad(tools, guidance, *toolBudget, h) },
-		Dir:         *dataDir,
-		IdleTimeout: *idle,
+		Provider:    openai.New(*o.baseURL, apiKey),
+		Model:       *o.model,
+		System:      *o.system,
+		NewToolbox:  func(h agent.Hooks) agent.Toolbox { return newPad(tools, guidance, *o.toolBudget, h) },
+		Dir:         *o.dataDir,
+		IdleTimeout: *o.idle,
 	}, ch.Emit)
 	if err != nil {
 		return err
@@ -135,9 +134,9 @@ func run() error {
 
 	err = ch.Run(runCtx, sessions)
 	if runCtx.Err() != nil && ctx.Err() == nil { // SIGTERM, not Ctrl-C
-		fmt.Fprintf(os.Stderr, "steel: finishing running work (up to %s; SIGTERM or Ctrl-C again to quit now)\n", *drain)
+		fmt.Fprintf(os.Stderr, "steel: finishing running work (up to %s; SIGTERM or Ctrl-C again to quit now)\n", *o.drain)
 		again, stopAgain := signal.NotifyContext(ctx, syscall.SIGTERM)
-		drainCtx, cancel := context.WithTimeout(again, *drain)
+		drainCtx, cancel := context.WithTimeout(again, *o.drain)
 		if derr := sessions.Drain(drainCtx); derr != nil {
 			fmt.Fprintln(os.Stderr, "steel: cancelling unfinished work:", derr)
 		}
@@ -145,30 +144,6 @@ func run() error {
 		stopAgain()
 	}
 	return err
-}
-
-// config is steel's config file.
-type config struct {
-	MCPServers map[string]mcp.ServerConfig `json:"mcpServers"`
-	Telegram   struct {
-		AllowedUsers []int64 `json:"allowedUsers"`
-	} `json:"telegram"`
-}
-
-// loadConfig reads path; a missing file means an empty config.
-func loadConfig(path string) (config, error) {
-	var c config
-	b, err := os.ReadFile(path)
-	if errors.Is(err, fs.ErrNotExist) {
-		return c, nil
-	}
-	if err == nil {
-		err = json.Unmarshal(b, &c)
-	}
-	if err != nil {
-		return c, fmt.Errorf("config %s: %w", path, err)
-	}
-	return c, nil
 }
 
 // withoutCollisions appends extra to builtin, skipping (with a warning) tools
