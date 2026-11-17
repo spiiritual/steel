@@ -75,7 +75,7 @@ jobs:
           tags: |
             ghcr.io/${{ github.repository }}:${{ github.ref_name }}
             ghcr.io/${{ github.repository }}:latest
-      - uses: sigstore/cosign-installer@v4
+      - uses: sigstore/cosign-installer@v4.1.3
       - name: Sign image
         env:
           DIGEST: ${{ steps.image.outputs.digest }}
