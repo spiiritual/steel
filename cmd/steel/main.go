@@ -6,6 +6,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -104,6 +105,13 @@ func run() error {
 		fmt.Fprintln(os.Stderr, "steel:", w)
 	}
 
+	// Model calls are logged to stderr, which a service manager or
+	// `docker compose logs` keeps; in the terminal it would interleave
+	// with the chat.
+	callLogOut := io.Writer(os.Stderr)
+	if o.channel.value != "telegram" {
+		callLogOut = io.Discard
+	}
 	provider := openai.New(*o.baseURL, apiKey)
 	usageLog := usage.NewLog(usagePath(*o.configPath), func(err error) {
 		fmt.Fprintln(os.Stderr, "steel: recording usage:", err)
@@ -112,7 +120,7 @@ func run() error {
 	system := *o.system
 	var mem memory.Memory
 	if *o.memoryDir != "" {
-		opened, err := openMemory(o, usageLog.Track(provider, "compaction"))
+		opened, err := openMemory(o, usageLog.Track(logCalls(provider, "compaction", callLogOut), "compaction"))
 		if err != nil {
 			return err
 		}
@@ -137,14 +145,21 @@ func run() error {
 		delete(guidance, namespace(t.Name))
 	}
 	sessions, err := agent.NewSessions(agent.Config{
-		Provider:    usageLog.Track(provider, "turn"),
+		Provider:    usageLog.Track(logCalls(provider, "turn", callLogOut), "turn"),
 		Model:       *o.model,
 		System:      system,
 		Memory:      mem,
 		NewToolbox:  func(h agent.Hooks) agent.Toolbox { return newPad(tools, guidance, *o.toolBudget, h) },
 		Dir:         *o.dataDir,
 		IdleTimeout: *o.idle,
-	}, ch.Emit)
+	}, func(id string, e agent.Event) {
+		// The channel shows a failed turn to the user; the log keeps it
+		// for whoever runs steel.
+		if d, ok := e.(agent.TurnDone); ok && d.Err != nil {
+			fmt.Fprintf(os.Stderr, "steel: %s: turn failed: %v\n", id, d.Err)
+		}
+		ch.Emit(id, e)
+	})
 	if err != nil {
 		return err
 	}
