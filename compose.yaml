@@ -1,0 +1,39 @@
+# A steel instance with its own desktop.
+#
+#   docker compose up -d                 start (or update: pull first)
+#   docker compose run --rm steel config set telegram-allowed-users 123456789
+#   docker compose exec steel steel usage
+#   docker compose logs -f
+#   open http://localhost:6080           watch or take over the desktop
+#
+# Update: docker compose pull && docker compose up -d. steel finishes its
+# running work first (stop_grace_period covers its 1m drain). Roll back by
+# pinning the previous tag below. Everything that lasts is in the volume.
+#
+# Secrets: put OPENAI_API_KEY and TELEGRAM_BOT_TOKEN in a .env file beside
+# this one (git ignores it), or save them in the volume with
+# `docker compose run --rm steel config set openai-api-key`.
+services:
+  steel:
+    image: ghcr.io/spiiritual/steel:latest
+    build: .
+    hostname: steel
+    restart: unless-stopped
+    stop_grace_period: 90s
+    shm_size: 2gb
+    environment:
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_BASE_URL: ${OPENAI_BASE_URL:-}
+      OPENAI_MODEL: ${OPENAI_MODEL:-}
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+      STEEL_VNC_PASSWORD: ${STEEL_VNC_PASSWORD:-}
+    ports:
+      # Whoever reaches this port controls the desktop. Keep it on
+      # localhost; from elsewhere use an SSH tunnel or Tailscale, and set
+      # STEEL_VNC_PASSWORD.
+      - "127.0.0.1:6080:6080"
+    volumes:
+      - home:/home/steel
+
+volumes:
+  home:

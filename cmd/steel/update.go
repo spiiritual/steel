@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
@@ -38,6 +39,9 @@ func runUpdate(args []string) error {
 		fs.PrintDefaults()
 	}
 	fs.Parse(args)
+	if err := notInContainer(); err != nil {
+		return err
+	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer stop()
@@ -68,6 +72,9 @@ func runUpdate(args []string) error {
 }
 
 func runRollback() error {
+	if err := notInContainer(); err != nil {
+		return err
+	}
 	exe, err := executable()
 	if err != nil {
 		return err
@@ -77,6 +84,16 @@ func runRollback() error {
 	}
 	fmt.Printf("restored the previous %s; run `steel rollback` again to undo. Restart steel to run it.\n", exe)
 	return nil
+}
+
+// notInContainer refuses to replace the binary inside steel's image, which
+// sets STEEL_CONTAINER: the next container would start from the image's
+// binary again, so the update would quietly undo itself.
+func notInContainer() error {
+	if os.Getenv("STEEL_CONTAINER") == "" {
+		return nil
+	}
+	return errors.New("steel runs in a container here, so it updates with its image: on the host, run `docker compose pull && docker compose up -d`, or pin an earlier image tag to roll back")
 }
 
 // executable is this binary's real path: updates replace the file, not a
