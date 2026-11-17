@@ -279,8 +279,16 @@ func TestNewClearsConversation(t *testing.T) {
 	if got, want := roles(h.llm.req(1).Messages), "system:sys user:fresh"; got != want {
 		t.Errorf("got %s, want %s", got, want)
 	}
-	if h.box(0).resets != 1 {
-		t.Errorf("toolbox Reset called %d times", h.box(0).resets)
+	// The old toolbox is closed and the new conversation gets its own.
+	b := h.box(0)
+	b.mu.Lock()
+	closed := b.closed
+	b.mu.Unlock()
+	h.mu.Lock()
+	n := len(h.boxes)
+	h.mu.Unlock()
+	if !closed || n != 2 {
+		t.Errorf("old toolbox closed = %v, toolboxes = %d", closed, n)
 	}
 }
 

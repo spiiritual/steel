@@ -24,22 +24,31 @@ func New[A, R any](name, description string, fn func(ctx context.Context, args A
 	if argsT.Kind() == reflect.Struct && len(fields(argsT)) == 0 {
 		params = ""
 	}
+	signature := fmt.Sprintf("(%s): Promise<%s>", params, tsType(reflect.TypeFor[R](), 0, nil))
 	return Tool{
 		Name:        name,
 		Description: description,
-		Signature:   fmt.Sprintf("(%s): Promise<%s>", params, tsType(reflect.TypeFor[R](), 0, nil)),
+		Signature:   signature,
 		Run: func(ctx context.Context, raw json.RawMessage) (any, error) {
 			var args A
 			if len(raw) > 0 {
 				dec := json.NewDecoder(bytes.NewReader(raw))
 				dec.DisallowUnknownFields()
 				if err := dec.Decode(&args); err != nil {
-					return nil, fmt.Errorf("invalid arguments: %w", err)
+					return nil, ArgsError(name, signature, err)
 				}
 			}
 			return fn(ctx, args)
 		},
 	}
+}
+
+// ArgsError reports arguments that don't fit a tool, including its full
+// signature, so a model that guessed the arguments can fix the call from
+// the error alone instead of looking the tool up first.
+func ArgsError(name, signature string, err error) error {
+	msg := strings.TrimPrefix(err.Error(), "validating root: ")
+	return fmt.Errorf("invalid arguments: %s\nExpected: tools.%s%s", msg, name, signature)
 }
 
 var (

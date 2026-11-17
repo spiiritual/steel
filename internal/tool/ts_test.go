@@ -115,7 +115,12 @@ func TestRunDecodesStrictly(t *testing.T) {
 	if out, err := tl.Run(context.Background(), json.RawMessage(`{"path":"a"}`)); err != nil || out != "got a" {
 		t.Errorf("Run = %v, %v", out, err)
 	}
-	if _, err := tl.Run(context.Background(), json.RawMessage(`{"file":"a"}`)); err == nil || !strings.Contains(err.Error(), `unknown field "file"`) {
+	_, err := tl.Run(context.Background(), json.RawMessage(`{"file":"a"}`))
+	if err == nil || !strings.Contains(err.Error(), `unknown field "file"`) {
 		t.Errorf("typo'd field not rejected: %v", err)
+	}
+	// The error carries the signature so the model can fix the call directly.
+	if !strings.Contains(err.Error(), "Expected: tools.t(args: { path: string }): Promise<string>") {
+		t.Errorf("error lacks signature: %v", err)
 	}
 }

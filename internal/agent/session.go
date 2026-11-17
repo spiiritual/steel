@@ -74,10 +74,14 @@ func (s *Session) Send(text string) {
 		s.gen++
 		s.history = s.fresh()
 		s.notes, s.evicted = nil, false
+		// A new toolbox, not a reset one: what a toolbox remembers about the
+		// conversation (e.g. which tools' docs the model has seen) must go
+		// with it.
 		box := s.box
+		s.box = nil
 		s.mu.Unlock()
 		if box != nil {
-			box.Reset()
+			box.Close()
 		}
 		s.save()
 		s.emit(Notice{Text: "Started a new conversation."})

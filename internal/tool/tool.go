@@ -25,8 +25,9 @@ type Tool struct {
 
 // Registry is an ordered set of tools.
 type Registry struct {
-	tools []Tool
-	index map[string]int
+	tools  []Tool
+	index  map[string]int
+	recent *Recent // nil: not tracked
 }
 
 // NewRegistry returns a registry of tools. It panics on duplicate names.
@@ -41,6 +42,21 @@ func NewRegistry(tools ...Tool) *Registry {
 	return r
 }
 
+// TrackRecent records every successful call in rec. Call it before the
+// registry is in use.
+func (r *Registry) TrackRecent(rec *Recent) {
+	r.recent = rec
+}
+
+// Recent returns tool names, most recently used successfully first; nil
+// when not tracked.
+func (r *Registry) Recent() []string {
+	if r.recent == nil {
+		return nil
+	}
+	return r.recent.Names()
+}
+
 // All returns the registered tools in registration order.
 func (r *Registry) All() []Tool {
 	return append([]Tool(nil), r.tools...)
@@ -52,5 +68,9 @@ func (r *Registry) Call(ctx context.Context, name string, args json.RawMessage) 
 	if !ok {
 		return nil, fmt.Errorf("unknown tool %q", name)
 	}
-	return r.tools[i].Run(ctx, args)
+	out, err := r.tools[i].Run(ctx, args)
+	if err == nil && r.recent != nil {
+		r.recent.Use(name)
+	}
+	return out, err
 }

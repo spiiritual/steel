@@ -106,6 +106,10 @@ func TestErrors(t *testing.T) {
 	if r := run(t, p, "const a = 1;\nnull.x"); !strings.Contains(r.Error, "script:2") {
 		t.Errorf("uncaught error should point at line 2: %+v", r)
 	}
+	// A failed tool call's error doesn't carry steel's Go stack frames.
+	if r := run(t, p, `await tools.t.fail()`); r.Error != "GoError: t.fail: boom" {
+		t.Errorf("tool error = %q", r.Error)
+	}
 	if r := run(t, p, `return (`); r.Error == "" {
 		t.Errorf("syntax error not reported: %+v", r)
 	}
@@ -319,5 +323,118 @@ func TestResultSurvivesHugeLogs(t *testing.T) {
 	s := r.String()
 	if len(s) > maxResult+100 || !strings.HasSuffix(s, "[result]\nthe answer") {
 		t.Errorf("len %d, tail %q", len(s), s[max(0, len(s)-40):])
+	}
+}
+
+func TestCatalogAndIndexedDescription(t *testing.T) {
+	p := New(testTools(), Options{DeclBudget: 1}) // too small for anything: all indexed
+	defer p.Close()
+
+	desc := p.Defs()[0].Description
+	if !strings.Contains(desc, "tools.t:\n  echo\n  fail\n  sleep\n  stat") || !strings.Contains(desc, "tools.$catalog") {
+		t.Errorf("description lacks index or catalog hint:\n%s", desc)
+	}
+	if r := run(t, p, `tools.$catalog.filter(t => /echo|stat/.test(t.name)).map(t => t.name).join(",")`); r.Value != "t.echo,t.stat" {
+		t.Errorf("catalog query = %+v", r)
+	}
+	// Indexed tools are callable directly; the first call returns their
+	// documentation, the second runs them.
+	if r := run(t, p, `await tools.t.echo({x: 1})`); !strings.Contains(r.Error, "did not run") {
+		t.Errorf("first call = %+v", r)
+	}
+	if r := run(t, p, `await tools.t.echo({x: 1})`); r.Value != `echo {"x":1}` {
+		t.Errorf("second call = %+v", r)
+	}
+	// With the default budget everything is declared and there's no index.
+	small := New(testTools(), Options{})
+	defer small.Close()
+	if desc := small.Defs()[0].Description; strings.Contains(desc, "More tools,") {
+		t.Errorf("small registry was indexed:\n%s", desc)
+	}
+}
+
+func TestIndexedToolsDiscloseBeforeRunning(t *testing.T) {
+	shown := tool.Tool{Name: "shown.echo", Run: func(context.Context, json.RawMessage) (any, error) { return "shown", nil }}
+	indexed := tool.Tool{Name: "t.wipe", Description: "Deletes everything.", Signature: "(args: {\n  /** Account to wipe. */\n  id: string;\n}): Promise<string>",
+		Run: func(context.Context, json.RawMessage) (any, error) { return "wiped", nil }}
+	sibling := tool.Tool{Name: "t.peek", Description: "Looks.", Run: func(context.Context, json.RawMessage) (any, error) { return "peeked", nil }}
+	var ran atomic.Int32
+	p := New(tool.NewRegistry(shown, indexed, sibling), Options{
+		DeclBudget: len(render([]tool.Tool{shown})), // room for "shown" only
+		Guidance:   map[string]string{"t": "Wipes are permanent. Ask first."},
+		OnCall: func(e CallEvent) {
+			if e.Done && e.Err == nil {
+				ran.Add(1)
+			}
+		},
+	})
+	defer p.Close()
+
+	// Indexed namespaces show a guidance summary, not the full notes.
+	if desc := p.Defs()[0].Description; !strings.Contains(desc, "tools.t: Wipes are permanent\n") || strings.Contains(desc, "Ask first") {
+		t.Errorf("description:\n%s", desc)
+	}
+	// Fully declared tools run on the first call.
+	if r := run(t, p, `await tools.shown.echo()`); r.Value != "shown" {
+		t.Fatalf("declared tool = %+v", r)
+	}
+	// Every call to an indexed tool is refused until a result has carried
+	// its documentation (and, once per namespace, the provider's full
+	// notes), even calls made in parallel.
+	r := run(t, p, `await Promise.all([1, 2, 3].map(n => tools.t.wipe({id: "a" + n})))`)
+	if !strings.Contains(r.Error, "did not run") || strings.Count(r.Docs, "Deletes everything.") != 1 || !strings.Contains(r.Docs, "Account to wipe.") || !strings.Contains(r.Docs, "> Wipes are permanent. Ask first.") {
+		t.Fatalf("first calls = %+v", r)
+	}
+	if !strings.Contains(r.String(), "[documentation]\n") {
+		t.Errorf("rendered result lacks documentation:\n%s", r)
+	}
+	if ran.Load() != 1 {
+		t.Fatalf("indexed tool ran before its documentation was returned: %d runs", ran.Load()-1)
+	}
+	// Documentation arrives even when the script swallows the refusal;
+	// notes aren't repeated.
+	r = run(t, p, `try { await tools.t.peek() } catch (e) {} return "ok"`)
+	if r.Value != "ok" || !strings.Contains(r.Docs, "Looks.") || strings.Contains(r.Docs, "Ask first") {
+		t.Errorf("caught refusal = %+v", r)
+	}
+	// Once documented, calls run, even after a reset.
+	p.Reset()
+	if r := run(t, p, `await tools.t.wipe({id: "a"})`); r.Value != "wiped" || r.Docs != "" {
+		t.Fatalf("documented call = %+v", r)
+	}
+}
+
+func TestRefusalHiddenByPromiseAllStillDocumented(t *testing.T) {
+	ok := func(context.Context, json.RawMessage) (any, error) { return "ok", nil }
+	p := New(tool.NewRegistry(tool.Tool{Name: "t.a", Run: ok}, tool.Tool{Name: "t.b", Description: "B docs.", Run: ok}), Options{DeclBudget: 1})
+	defer p.Close()
+	// Promise.all surfaces only a's rejection; b's documentation still comes back.
+	r := run(t, p, `await Promise.all([tools.t.a(), tools.t.b()])`)
+	if !strings.Contains(r.Error, "t.a did not run") || !strings.Contains(r.Docs, "B docs.") {
+		t.Errorf("result = %+v", r)
+	}
+	if r := run(t, p, `await tools.t.b()`); r.Value != "ok" {
+		t.Errorf("b after documentation = %+v", r)
+	}
+}
+
+func TestDocsLookupUnlocksWithoutRunning(t *testing.T) {
+	var runs atomic.Int32
+	ok := func(context.Context, json.RawMessage) (any, error) { runs.Add(1); return "ok", nil }
+	p := New(tool.NewRegistry(tool.Tool{Name: "t.a", Description: "A docs.", Run: ok}, tool.Tool{Name: "t.b", Description: "B docs.", Run: ok}), Options{DeclBudget: 1})
+	defer p.Close()
+
+	// Docs for several tools come back with the result; nothing runs, even if
+	// the script drops $docs's return value.
+	r := run(t, p, `tools.$docs("t.a", "tools.t.b"); "looked"`)
+	if r.Value != "looked" || !strings.Contains(r.Docs, "A docs.") || !strings.Contains(r.Docs, "B docs.") || runs.Load() != 0 {
+		t.Fatalf("lookup = %+v, runs = %d", r, runs.Load())
+	}
+	// Both are unlocked; looking them up again adds nothing.
+	if r := run(t, p, `tools.$docs("t.a"); await Promise.all([tools.t.a(), tools.t.b()])`); r.Error != "" || r.Docs != "" || runs.Load() != 2 {
+		t.Errorf("after lookup = %+v, runs = %d", r, runs.Load())
+	}
+	if r := run(t, p, `tools.$docs("t.nope")`); !strings.Contains(r.Error, `no tool named "t.nope"`) {
+		t.Errorf("unknown tool = %+v", r)
 	}
 }

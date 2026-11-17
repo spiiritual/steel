@@ -59,7 +59,7 @@ type Toolbox interface {
 	// Stop halts running work and drops background jobs; once it returns no
 	// job result is delivered. It reports whether state was lost doing so.
 	Stop() bool
-	Reset()     // discard all state
+	Reset()     // discard script state: variables and running work
 	Busy() bool // background work still pending or being delivered
 	Close()
 }
