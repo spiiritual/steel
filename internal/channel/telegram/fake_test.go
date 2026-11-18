@@ -254,6 +254,15 @@ func (s *fakeSessions) Send(id, text string) {
 	}
 }
 
+// Answer records the answer and reports whether the request was waiting:
+// only IDs starting with "live" are.
+func (s *fakeSessions) Answer(id, approvalID string, allow bool) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.sent = append(s.sent, fmt.Sprintf("%s: answer %s %v", id, approvalID, allow))
+	return strings.HasPrefix(approvalID, "live")
+}
+
 func (s *fakeSessions) got() []string {
 	s.mu.Lock()
 	defer s.mu.Unlock()

@@ -90,6 +90,9 @@ type Options struct {
 	// are shown upfront; indexed ones get a one-line summary, with the full
 	// notes in the first documentation for one of the namespace's tools.
 	Guidance map[string]string
+	// Approver, if set, is how tools ask the user to approve an action
+	// (tool.Approve). Without it, actions that need approval are refused.
+	Approver tool.Approver
 }
 
 // Result is the outcome of one script.
@@ -215,7 +218,11 @@ func New(reg *tool.Registry, opts Options) *Pad {
 
 func (p *Pad) newRuntime() *runtime {
 	rt := &runtime{loop: eventloop.NewEventLoop(), dead: make(chan struct{})}
-	rt.ctx, rt.cancel = context.WithCancel(context.Background())
+	ctx := context.Background()
+	if p.opts.Approver != nil {
+		ctx = tool.WithApprover(ctx, p.opts.Approver)
+	}
+	rt.ctx, rt.cancel = context.WithCancel(ctx)
 	rt.loop.Start()
 	ready := make(chan struct{})
 	rt.loop.RunOnLoop(func(vm *goja.Runtime) {

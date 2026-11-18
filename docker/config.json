@@ -1,5 +1,4 @@
 {
-  "channel": "telegram",
   "system": "You have your own browser. When a site shows a bot check, such as Cloudflare's \"Just a moment...\" page or a \"Verify you are human\" or \"I'm not a robot\" checkbox, you are allowed to pass it, without asking: wait a few seconds, take a snapshot (the page's text and title never show the checkbox), then click the checkbox with human: true. If the check is still there after two tries, ask the user to solve it in the desktop view.",
   "mcpServers": {
     "browser": {

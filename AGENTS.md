@@ -14,7 +14,7 @@ steel is a personal agent harness in Go. It's used mainly through Telegram and t
 |---|---|
 | `cmd/steel` | Wiring, flags, `config`/`update`/`rollback` subcommands |
 | `internal/agent` | Sessions: inbox, turns, history, events. Knows nothing about channels |
-| `internal/channel/{terminal,telegram}` | Channels: send user text into `agent.Sessions`, render `agent.Event`s |
+| `internal/channel/telegram` | The channel: sends user text into `agent.Sessions`, renders `agent.Event`s |
 | `internal/llm`, `internal/llm/openai` | Provider interface and the OpenAI-compatible streaming client |
 | `internal/scratchpad` | The goja JS runtime behind `run_code`: tool layout, disclosure, background jobs |
 | `internal/tool` | `Tool`, `Registry`, builtins, Go types → TypeScript, JSON Schema → TypeScript, recent-tools list |

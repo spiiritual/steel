@@ -46,12 +46,42 @@ type TurnDone struct{ Err error }
 // Notice is a message from steel itself, e.g. a command acknowledgement.
 type Notice struct{ Text string }
 
+// ApprovalRequest asks the user whether a tool may do something. Channels
+// show it and pass the answer to Sessions.Answer; an ApprovalDone with the
+// same ID follows however it ends.
+type ApprovalRequest struct {
+	ID      string // random, so answers to an old process's requests match nothing
+	Tool    string
+	Action  string   // what would run, to show verbatim
+	Reasons []string // why it needs approval
+}
+
+// ApprovalDone reports how an ApprovalRequest ended, so channels can update
+// or withdraw it.
+type ApprovalDone struct {
+	ID      string
+	Outcome ApprovalOutcome
+}
+
+// ApprovalOutcome is how an ApprovalRequest ended.
+type ApprovalOutcome string
+
+const (
+	Allowed   ApprovalOutcome = "allowed"
+	Refused   ApprovalOutcome = "refused"
+	Expired   ApprovalOutcome = "expired"   // nobody answered in time
+	Cancelled ApprovalOutcome = "cancelled" // the work asking was stopped
+)
+
 func (TextDelta) event() {}
 func (Reply) event()     {}
 func (ToolStart) event() {}
 func (ToolEnd) event()   {}
 func (TurnDone) event()  {}
 func (Notice) event()    {}
+
+func (ApprovalRequest) event() {}
+func (ApprovalDone) event()    {}
 
 // Toolbox is what a session gives the model; in steel, a scratchpad.
 type Toolbox interface {
@@ -72,6 +102,9 @@ type Hooks struct {
 	// Deliver queues text for the model, e.g. a finished background job.
 	// Safe for concurrent use.
 	Deliver func(text string)
+	// Approve asks the user whether a tool may do something and waits for
+	// the answer, until ctx ends. Safe for concurrent use.
+	Approve func(ctx context.Context, tool, action string, reasons []string) (bool, error)
 }
 
 // Config describes how sessions are built.

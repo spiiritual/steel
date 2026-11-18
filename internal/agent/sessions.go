@@ -56,6 +56,15 @@ func (ss *Sessions) Send(id, text string) {
 	}
 }
 
+// Answer passes the user's answer to an ApprovalRequest from session id,
+// reporting whether the request was still waiting for one.
+func (ss *Sessions) Answer(id, approvalID string, allow bool) bool {
+	ss.mu.Lock()
+	s, ok := ss.m[id]
+	ss.mu.Unlock()
+	return ok && s.answer(approvalID, allow)
+}
+
 // get returns id's session, creating it if needed; nil after Close.
 func (ss *Sessions) get(id string) *Session {
 	ss.mu.Lock()

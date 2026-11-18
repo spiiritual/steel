@@ -47,6 +47,17 @@ type chat struct {
 	dirty                            bool // the draft is out of date
 	showing                          bool // a draft is on screen
 	lastDraft, nextDraft, nextTyping time.Time
+	approvals                        map[string]approvalMessage // by request ID, while waiting
+}
+
+// maxApprovalAction is how much of a command an approval request shows,
+// in UTF-16 code units, leaving room for its reasons.
+const maxApprovalAction = 3000
+
+// approvalMessage is a sent ApprovalRequest.
+type approvalMessage struct {
+	id   int64 // message ID
+	text string
 }
 
 func newChat(b *Bot, id int64) *chat {
@@ -145,6 +156,12 @@ func (c *chat) apply(e any) {
 	case agent.Notice:
 		c.send(e.Text)
 		c.dirty = c.active // the message replaced the draft; bring it back
+	case agent.ApprovalRequest:
+		c.flush() // what the model said so far explains the request
+		c.askApproval(e)
+		c.dirty = c.active
+	case agent.ApprovalDone:
+		c.approvalDone(e)
 	case agent.TurnDone:
 		c.flush() // e.g. a reply cut off by an error
 		if e.Err != nil {
@@ -186,6 +203,59 @@ func (c *chat) send(text string) {
 	if len(parts) > 0 {
 		c.showing = false
 		c.draftID++
+	}
+}
+
+// askApproval sends an approval request with Allow and Refuse buttons.
+func (c *chat) askApproval(e agent.ApprovalRequest) {
+	action := e.Action
+	if utf16Len(action) > maxApprovalAction {
+		action = action[:prefix(action, maxApprovalAction)] + "\n… (cut; the rest runs too)"
+	}
+	text := "Allow this?\n\n" + action
+	if len(e.Reasons) > 0 {
+		text += "\n\nIt " + strings.Join(e.Reasons, "; ") + "."
+	}
+	text = tail(text, maxText-100) // room for the outcome line
+	var sent message
+	err := c.b.api.callRetry(c.b.ctx, "sendMessage", sendMessageParams{
+		ChatID: c.id,
+		Text:   text,
+		ReplyMarkup: &inlineKeyboard{InlineKeyboard: [][]inlineButton{{
+			{Text: "Allow", CallbackData: allowPrefix + e.ID},
+			{Text: "Refuse", CallbackData: refusePrefix + e.ID},
+		}}},
+	}, &sent, requestTimeout, c.b.sendAttempts)
+	if err != nil {
+		if c.b.ctx.Err() == nil {
+			c.b.logf("chat %d: approval request not delivered: %v", c.id, err)
+		}
+		return // nobody can answer; the request expires
+	}
+	c.showing = false
+	c.draftID++
+	if c.approvals == nil {
+		c.approvals = map[string]approvalMessage{}
+	}
+	c.approvals[e.ID] = approvalMessage{id: sent.MessageID, text: text}
+}
+
+// approvalDone replaces a request's buttons with its outcome.
+func (c *chat) approvalDone(e agent.ApprovalDone) {
+	m, ok := c.approvals[e.ID]
+	if !ok {
+		return
+	}
+	delete(c.approvals, e.ID)
+	outcome := map[agent.ApprovalOutcome]string{
+		agent.Allowed:   "✅ Allowed",
+		agent.Refused:   "❌ Refused",
+		agent.Expired:   "⌛ No answer in time, so it didn't run",
+		agent.Cancelled: "Cancelled",
+	}[e.Outcome]
+	err := c.b.api.callRetry(c.b.ctx, "editMessageText", editMessageTextParams{ChatID: c.id, MessageID: m.id, Text: m.text + "\n\n" + outcome}, nil, requestTimeout, c.b.sendAttempts)
+	if err != nil && c.b.ctx.Err() == nil {
+		c.b.logf("chat %d: approval request not updated: %v", c.id, err)
 	}
 }
 

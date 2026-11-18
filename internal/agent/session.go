@@ -2,6 +2,8 @@ package agent
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -47,6 +49,9 @@ type Session struct {
 	evicted  bool // box was closed for idleness; tell the model next turn
 	closed   bool
 	lastUsed time.Time
+	// approvals are the requests waiting for the user, by ID; each channel
+	// takes one answer.
+	approvals map[string]chan bool
 }
 
 func newSession(id string, cfg *Config, emit func(Event)) *Session {
@@ -91,6 +96,57 @@ func (s *Session) Send(text string) {
 	default:
 		s.enqueue(llm.Message{Role: llm.RoleUser, Content: text})
 	}
+}
+
+// approve asks the user to approve a tool's action and waits for the
+// answer or for ctx to end.
+func (s *Session) approve(ctx context.Context, tool, action string, reasons []string) (bool, error) {
+	var b [8]byte
+	rand.Read(b[:])
+	id := hex.EncodeToString(b[:])
+	answer := make(chan bool, 1)
+	s.mu.Lock()
+	if s.approvals == nil {
+		s.approvals = map[string]chan bool{}
+	}
+	s.approvals[id] = answer
+	s.mu.Unlock()
+	defer func() {
+		s.mu.Lock()
+		delete(s.approvals, id)
+		s.mu.Unlock()
+	}()
+
+	s.emit(ApprovalRequest{ID: id, Tool: tool, Action: action, Reasons: reasons})
+	select {
+	case ok := <-answer:
+		outcome := Refused
+		if ok {
+			outcome = Allowed
+		}
+		s.emit(ApprovalDone{ID: id, Outcome: outcome})
+		return ok, nil
+	case <-ctx.Done():
+		outcome := Cancelled
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			outcome = Expired
+		}
+		s.emit(ApprovalDone{ID: id, Outcome: outcome})
+		return false, ctx.Err()
+	}
+}
+
+// answer passes the user's answer to approval request id, reporting
+// whether it was still waiting.
+func (s *Session) answer(id string, allow bool) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	ch, ok := s.approvals[id]
+	if ok {
+		delete(s.approvals, id)
+		ch <- allow
+	}
+	return ok
 }
 
 // deliver queues text from a toolbox (e.g. a finished job) for the model.
@@ -247,7 +303,7 @@ func (s *Session) toolbox() Toolbox {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.box == nil && s.cfg.NewToolbox != nil && !s.closed {
-		s.box = s.cfg.NewToolbox(Hooks{Emit: s.emit, Deliver: s.deliver})
+		s.box = s.cfg.NewToolbox(Hooks{Emit: s.emit, Deliver: s.deliver, Approve: s.approve})
 		if s.evicted {
 			s.evicted = false
 			s.notes = append(s.notes, llm.Message{Role: llm.RoleUser, Content: "[steel] The scratchpad was closed after inactivity; globals from earlier run_code calls are gone."})

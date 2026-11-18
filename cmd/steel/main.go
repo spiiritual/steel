@@ -6,7 +6,6 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	"io"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -14,8 +13,8 @@ import (
 	"syscall"
 
 	"github.com/spiiritual/steel/internal/agent"
+	"github.com/spiiritual/steel/internal/bashcheck"
 	"github.com/spiiritual/steel/internal/channel/telegram"
-	"github.com/spiiritual/steel/internal/channel/terminal"
 	"github.com/spiiritual/steel/internal/llm/openai"
 	"github.com/spiiritual/steel/internal/mcp"
 	"github.com/spiiritual/steel/internal/memory"
@@ -77,20 +76,11 @@ func run() error {
 		return err
 	}
 
-	var ch interface {
-		Emit(id string, e agent.Event)
-		Run(ctx context.Context, ss *agent.Sessions) error
+	if token == "" {
+		return errors.New("no Telegram bot token: run `steel config set telegram-bot-token`")
 	}
-	if o.channel.value == "telegram" {
-		if token == "" {
-			return errors.New("the telegram channel needs a bot token: run `steel config set telegram-bot-token`")
-		}
-		bot := telegram.New(telegram.Options{Token: token, AllowedUsers: *o.allowedUsers})
-		defer bot.Close() // runs after sessions.Close, so their last messages go out
-		ch = bot
-	} else {
-		ch = terminal.New(os.Stdin, os.Stdout)
-	}
+	bot := telegram.New(telegram.Options{Token: token, AllowedUsers: *o.allowedUsers})
+	defer bot.Close() // runs after sessions.Close, so their last messages go out
 
 	// Ctrl-C quits now, cancelling running work. SIGTERM, which service
 	// managers send, stops taking input and lets running work finish first.
@@ -105,22 +95,27 @@ func run() error {
 		fmt.Fprintln(os.Stderr, "steel:", w)
 	}
 
-	// Model calls are logged to stderr, which a service manager or
-	// `docker compose logs` keeps; in the terminal it would interleave
-	// with the chat.
-	callLogOut := io.Writer(os.Stderr)
-	if o.channel.value != "telegram" {
-		callLogOut = io.Discard
-	}
 	provider := openai.New(*o.baseURL, apiKey)
 	usageLog := usage.NewLog(usagePath(*o.configPath), func(err error) {
 		fmt.Fprintln(os.Stderr, "steel: recording usage:", err)
 	})
-	builtin := []tool.Tool{tool.ReadFile(cwd), tool.Bash(cwd)}
+	home, _ := os.UserHomeDir()
+	// Commands touching steel's own state need approval: its settings,
+	// secrets, history and memory.
+	protected := []string{filepath.Dir(*o.configPath)}
+	for _, dir := range []string{*o.dataDir, *o.memoryDir} {
+		if dir != "" {
+			protected = append(protected, dir)
+		}
+	}
+	check := func(cmd string) []string {
+		return bashcheck.Check(cmd, bashcheck.Options{Dir: cwd, Home: home, Protected: protected})
+	}
+	builtin := []tool.Tool{tool.Bash(cwd, check)}
 	system := *o.system
 	var mem memory.Memory
 	if *o.memoryDir != "" {
-		opened, err := openMemory(o, usageLog.Track(logCalls(provider, "compaction", callLogOut), "compaction"))
+		opened, err := openMemory(o, usageLog.Track(logCalls(provider, "compaction", os.Stderr), "compaction"))
 		if err != nil {
 			return err
 		}
@@ -145,7 +140,7 @@ func run() error {
 		delete(guidance, namespace(t.Name))
 	}
 	sessions, err := agent.NewSessions(agent.Config{
-		Provider:    usageLog.Track(logCalls(provider, "turn", callLogOut), "turn"),
+		Provider:    usageLog.Track(logCalls(provider, "turn", os.Stderr), "turn"),
 		Model:       *o.model,
 		System:      system,
 		Memory:      mem,
@@ -158,14 +153,14 @@ func run() error {
 		if d, ok := e.(agent.TurnDone); ok && d.Err != nil {
 			fmt.Fprintf(os.Stderr, "steel: %s: turn failed: %v\n", id, d.Err)
 		}
-		ch.Emit(id, e)
+		bot.Emit(id, e)
 	})
 	if err != nil {
 		return err
 	}
 	defer sessions.Close() // cancels whatever is still running
 
-	err = ch.Run(runCtx, sessions)
+	err = bot.Run(runCtx, sessions)
 	if runCtx.Err() != nil && ctx.Err() == nil { // SIGTERM, not Ctrl-C
 		fmt.Fprintf(os.Stderr, "steel: finishing running work (up to %s; SIGTERM or Ctrl-C again to quit now)\n", *o.drain)
 		again, stopAgain := signal.NotifyContext(ctx, syscall.SIGTERM)
@@ -208,7 +203,7 @@ func withoutCollisions(builtin, extra []tool.Tool) []tool.Tool {
 	return builtin
 }
 
-// namespace returns a tool's top-level namespace: "fs" for "fs.read_file".
+// namespace returns a tool's top-level namespace: "shell" for "shell.bash".
 func namespace(name string) string {
 	ns, _, _ := strings.Cut(name, ".")
 	return ns
@@ -227,6 +222,9 @@ func newPad(tools *tool.Registry, guidance map[string]string, toolBudget int, h 
 	return scratchpad.New(tools, scratchpad.Options{
 		DeclBudget: declBudget,
 		Guidance:   guidance,
+		Approver: func(ctx context.Context, a tool.Approval) (bool, error) {
+			return h.Approve(ctx, a.Tool, a.Action, a.Reasons)
+		},
 		OnCall: func(e scratchpad.CallEvent) {
 			if !e.Done {
 				h.Emit(agent.ToolStart{Name: e.Name, Args: e.Args, Nested: true})

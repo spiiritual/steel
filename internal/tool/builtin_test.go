@@ -15,7 +15,7 @@ import (
 func runBash(t *testing.T, cmd string) (BashResult, error) {
 	t.Helper()
 	raw, _ := json.Marshal(map[string]string{"cmd": cmd})
-	out, err := Bash(t.TempDir()).Run(context.Background(), raw)
+	out, err := Bash(t.TempDir(), nil).Run(context.Background(), raw)
 	if err != nil {
 		return BashResult{}, err
 	}
@@ -100,49 +100,58 @@ func TestCappedWriterSmallWrites(t *testing.T) {
 	}
 }
 
-func TestReadFile(t *testing.T) {
+func approvalTest(t *testing.T, answer func(Approval) (bool, error)) (ran bool, asked []Approval, err error) {
+	t.Helper()
 	dir := t.TempDir()
-	tl := ReadFile(dir)
-	read := func(path string) (string, error) {
-		raw, _ := json.Marshal(map[string]string{"path": path})
-		out, err := tl.Run(context.Background(), raw)
-		if err != nil {
-			return "", err
+	check := func(cmd string) []string {
+		if strings.Contains(cmd, "risky") {
+			return []string{"is risky"}
 		}
-		return out.(string), nil
+		return nil
+	}
+	ctx := WithApprover(context.Background(), func(_ context.Context, a Approval) (bool, error) {
+		asked = append(asked, a)
+		return answer(a)
+	})
+	raw, _ := json.Marshal(map[string]string{"cmd": "touch ran # risky"})
+	_, err = Bash(dir, check).Run(ctx, raw)
+	_, statErr := os.Stat(filepath.Join(dir, "ran"))
+	return statErr == nil, asked, err
+}
+
+func TestBashApproval(t *testing.T) {
+	ran, asked, err := approvalTest(t, func(Approval) (bool, error) { return true, nil })
+	if !ran || err != nil || len(asked) != 1 || asked[0].Action != "touch ran # risky" || asked[0].Reasons[0] != "is risky" {
+		t.Errorf("allowed: ran %v, asked %+v, err %v", ran, asked, err)
 	}
 
-	if err := os.WriteFile(filepath.Join(dir, "ok.txt"), []byte("hello"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if got, err := read("ok.txt"); err != nil || got != "hello" {
-		t.Errorf("ok.txt = %q, %v", got, err)
+	ran, _, err = approvalTest(t, func(Approval) (bool, error) { return false, nil })
+	if ran || err == nil || !strings.Contains(err.Error(), "refused") {
+		t.Errorf("refused: ran %v, err %v", ran, err)
 	}
 
-	if _, err := read(dir); err == nil || !strings.Contains(err.Error(), "not a regular file") {
-		t.Errorf("directory: %v", err)
+	ran, _, err = approvalTest(t, func(Approval) (bool, error) { return false, context.DeadlineExceeded })
+	if ran || err == nil || !strings.Contains(err.Error(), "didn't answer") {
+		t.Errorf("no answer: ran %v, err %v", ran, err)
 	}
+}
 
-	fifo := filepath.Join(dir, "fifo")
-	if err := syscall.Mkfifo(fifo, 0o644); err != nil {
-		t.Fatal(err)
-	}
-	done := make(chan error, 1)
-	go func() { _, err := read(fifo); done <- err }()
-	select {
-	case err := <-done:
-		if err == nil || !strings.Contains(err.Error(), "not a regular file") {
-			t.Errorf("fifo: %v", err)
+// Without anyone to ask, risky commands don't run; others do.
+func TestBashApprovalFailsClosed(t *testing.T) {
+	dir := t.TempDir()
+	bash := Bash(dir, func(cmd string) []string {
+		if strings.Contains(cmd, "risky") {
+			return []string{"is risky"}
 		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("reading a FIFO blocked")
+		return nil
+	})
+	if _, err := bash.Run(context.Background(), json.RawMessage(`{"cmd":"touch a # risky"}`)); err == nil || !strings.Contains(err.Error(), "can't be asked") {
+		t.Errorf("risky: %v", err)
 	}
-
-	big := filepath.Join(dir, "big.log")
-	if err := os.WriteFile(big, make([]byte, readFileMax+1), 0o644); err != nil {
-		t.Fatal(err)
+	if _, err := os.Stat(filepath.Join(dir, "a")); err == nil {
+		t.Error("risky command ran")
 	}
-	if _, err := read(big); err == nil || !strings.Contains(err.Error(), strconv.Itoa(readFileMax+1)+" bytes") || !strings.Contains(err.Error(), "head") {
-		t.Errorf("oversized: %v", err)
+	if _, err := bash.Run(context.Background(), json.RawMessage(`{"cmd":"touch b"}`)); err != nil {
+		t.Errorf("safe: %v", err)
 	}
 }

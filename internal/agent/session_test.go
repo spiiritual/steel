@@ -463,3 +463,102 @@ func waitFor(t *testing.T, cond func() bool) {
 		time.Sleep(5 * time.Millisecond)
 	}
 }
+
+// A tool's approval request reaches the channel as an event; the channel's
+// answer reaches the tool once, and the outcome is announced.
+func TestApprovalRoundTrip(t *testing.T) {
+	h := newHarness(t, Config{}, func(int, context.Context, llm.Request) (llm.Message, error) { return text("ok"), nil })
+	h.ss.Send("c", "hi")
+	h.waitTurn()
+	if h.ss.Answer("other", "x", true) {
+		t.Error("an unknown session accepted an answer")
+	}
+
+	request := func() ApprovalRequest {
+		var r ApprovalRequest
+		waitFor(t, func() bool {
+			h.mu.Lock()
+			defer h.mu.Unlock()
+			for _, e := range h.events {
+				if e, ok := e.(ApprovalRequest); ok && e.ID != "" {
+					r = e
+				}
+			}
+			return r.ID != ""
+		})
+		h.mu.Lock()
+		h.events = nil
+		h.mu.Unlock()
+		return r
+	}
+	done := func(id string) ApprovalOutcome {
+		var o ApprovalOutcome
+		waitFor(t, func() bool {
+			h.mu.Lock()
+			defer h.mu.Unlock()
+			for _, e := range h.events {
+				if e, ok := e.(ApprovalDone); ok && e.ID == id {
+					o = e.Outcome
+				}
+			}
+			return o != ""
+		})
+		return o
+	}
+	type result struct {
+		ok  bool
+		err error
+	}
+	ask := func(ctx context.Context) chan result {
+		c := make(chan result, 1)
+		go func() {
+			ok, err := h.box(0).hooks.Approve(ctx, "shell.bash", "rm -rf x", []string{"deletes recursively"})
+			c <- result{ok, err}
+		}()
+		return c
+	}
+
+	for _, allow := range []bool{true, false} {
+		res := ask(context.Background())
+		r := request()
+		if r.Action != "rm -rf x" || r.Tool != "shell.bash" || len(r.Reasons) != 1 {
+			t.Errorf("request %+v", r)
+		}
+		if !h.ss.Answer("c", r.ID, allow) {
+			t.Fatal("answer not accepted")
+		}
+		if h.ss.Answer("c", r.ID, !allow) {
+			t.Error("a second answer was accepted")
+		}
+		if got := <-res; got.ok != allow || got.err != nil {
+			t.Errorf("allow=%v: tool got %+v", allow, got)
+		}
+		want := map[bool]ApprovalOutcome{true: Allowed, false: Refused}[allow]
+		if o := done(r.ID); o != want {
+			t.Errorf("outcome %s, want %s", o, want)
+		}
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	res := ask(ctx)
+	r := request()
+	cancel() // e.g. /stop
+	if got := <-res; got.ok || got.err == nil {
+		t.Errorf("cancelled: tool got %+v", got)
+	}
+	if o := done(r.ID); o != Cancelled {
+		t.Errorf("outcome %s, want cancelled", o)
+	}
+	if h.ss.Answer("c", r.ID, true) {
+		t.Error("a cancelled request accepted an answer")
+	}
+
+	ctx, cancel = context.WithTimeout(context.Background(), 10*time.Millisecond)
+	defer cancel()
+	res = ask(ctx)
+	r = request()
+	<-res
+	if o := done(r.ID); o != Expired {
+		t.Errorf("outcome %s, want expired", o)
+	}
+}

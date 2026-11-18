@@ -44,7 +44,7 @@ func TestPollingHandsUpdatesInOrderAndConfirmsThem(t *testing.T) {
 	if num(first["timeout"]) != 30 {
 		t.Errorf("poll timeout %v, want 30", first["timeout"])
 	}
-	if got := fmt.Sprint(first["allowed_updates"]); got != "[message stopped_message_generation]" {
+	if got := fmt.Sprint(first["allowed_updates"]); got != "[message stopped_message_generation callback_query]" {
 		t.Errorf("allowed_updates %s", got)
 	}
 }
@@ -579,5 +579,61 @@ func TestTail(t *testing.T) {
 	}
 	if got := tail("abc", 3); got != "abc" {
 		t.Errorf("tail = %q", got)
+	}
+}
+
+func pressUpdate(id, from, chat, message int64, data string) map[string]any {
+	return map[string]any{"update_id": id, "callback_query": map[string]any{
+		"id":      fmt.Sprintf("q%d", id),
+		"from":    map[string]any{"id": from, "is_bot": false, "first_name": "U"},
+		"message": map[string]any{"message_id": message, "chat": map[string]any{"id": chat, "type": "private"}},
+		"data":    data,
+	}}
+}
+
+// An approval request shows its command, reasons and buttons; an allowed
+// user's press answers it, and its outcome replaces the buttons.
+func TestApproval(t *testing.T) {
+	f := newFakeAPI(t)
+	b, _, _ := testBot(t, f, 42)
+	ss := &fakeSessions{}
+	start(t, b, ss)
+	eventually(t, "polling", b.polling.Load)
+	const id = "telegram:42"
+
+	b.Emit(id, agent.ApprovalRequest{ID: "live1", Tool: "shell.bash", Action: "rm -rf build", Reasons: []string{"deletes recursively (rm -r)"}})
+	eventually(t, "request", func() bool { return len(f.callsOf("sendMessage")) == 1 })
+	msg := f.callsOf("sendMessage")[0].Params
+	if msg["text"] != "Allow this?\n\nrm -rf build\n\nIt deletes recursively (rm -r)." {
+		t.Errorf("text %q", msg["text"])
+	}
+	if got := fmt.Sprint(msg["reply_markup"]); !strings.Contains(got, "allow:live1") || !strings.Contains(got, "refuse:live1") {
+		t.Errorf("buttons %s", got)
+	}
+
+	f.add(
+		pressUpdate(1, 7, 42, 1, "allow:live1"),  // not an allowed user
+		pressUpdate(2, 42, 42, 1, "allow:live1"), // the user
+		pressUpdate(3, 42, 42, 9, "refuse:old"),  // a request from before a restart
+	)
+	eventually(t, "presses handled", func() bool { return lastOffset(f) == 4 })
+	want := []string{"telegram:42: answer live1 true", "telegram:42: answer old false"}
+	if !slices.Equal(ss.got(), want) {
+		t.Errorf("answers %q, want %q", ss.got(), want)
+	}
+	eventually(t, "every press answered", func() bool { return len(f.callsOf("answerCallbackQuery")) == 3 })
+	stale := f.callsOf("editMessageReplyMarkup")
+	if len(stale) != 1 || num(stale[0].Params["message_id"]) != 9 {
+		t.Errorf("stale buttons not removed: %v", stale)
+	}
+
+	b.Emit(id, agent.ApprovalDone{ID: "live1", Outcome: agent.Allowed})
+	eventually(t, "outcome", func() bool { return len(f.callsOf("editMessageText")) == 1 })
+	edit := f.callsOf("editMessageText")[0].Params
+	if num(edit["message_id"]) != 1 || !strings.HasSuffix(edit["text"].(string), "\n\n✅ Allowed") {
+		t.Errorf("edit %v", edit)
+	}
+	if _, ok := edit["reply_markup"]; ok {
+		t.Error("buttons kept after the outcome")
 	}
 }

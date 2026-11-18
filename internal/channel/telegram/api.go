@@ -24,6 +24,7 @@ type (
 		UpdateID                 int64              `json:"update_id"`
 		Message                  *message           `json:"message"`
 		StoppedMessageGeneration *generationStopped `json:"stopped_message_generation"`
+		CallbackQuery            *callbackQuery     `json:"callback_query"`
 	}
 	message struct {
 		MessageID int64   `json:"message_id"`
@@ -47,6 +48,14 @@ type (
 	}
 )
 
+// callbackQuery is a press of an inline keyboard button.
+type callbackQuery struct {
+	ID      string   `json:"id"`
+	From    *user    `json:"from"`
+	Message *message `json:"message"` // absent if the message is too old
+	Data    string   `json:"data"`
+}
+
 // flexInt is an integer Telegram may send as a JSON number or a string:
 // draft_id is documented as Integer but arrives as "123".
 type flexInt int64
@@ -69,8 +78,31 @@ type (
 		AllowedUpdates []string `json:"allowed_updates"`
 	}
 	sendMessageParams struct {
-		ChatID int64  `json:"chat_id"`
-		Text   string `json:"text"`
+		ChatID      int64           `json:"chat_id"`
+		Text        string          `json:"text"`
+		ReplyMarkup *inlineKeyboard `json:"reply_markup,omitempty"`
+	}
+	// editMessageTextParams without ReplyMarkup removes the message's
+	// buttons.
+	editMessageTextParams struct {
+		ChatID    int64  `json:"chat_id"`
+		MessageID int64  `json:"message_id"`
+		Text      string `json:"text"`
+	}
+	editMessageReplyMarkupParams struct {
+		ChatID    int64 `json:"chat_id"`
+		MessageID int64 `json:"message_id"`
+	}
+	answerCallbackQueryParams struct {
+		CallbackQueryID string `json:"callback_query_id"`
+		Text            string `json:"text,omitempty"`
+	}
+	inlineKeyboard struct {
+		InlineKeyboard [][]inlineButton `json:"inline_keyboard"`
+	}
+	inlineButton struct {
+		Text         string `json:"text"`
+		CallbackData string `json:"callback_data"`
 	}
 	sendMessageDraftParams struct {
 		ChatID  int64 `json:"chat_id"`

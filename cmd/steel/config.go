@@ -30,7 +30,7 @@ import (
 type options struct {
 	baseURL, model, system, configPath, dataDir *string
 	memoryDir, compactModel                     *string
-	channel, memorySystem                       *choice
+	memorySystem                                *choice
 	allowedUsers                                *idList
 	idle, drain                                 *time.Duration
 	toolBudget                                  *int
@@ -40,14 +40,12 @@ type options struct {
 func defineFlags(fs *flag.FlagSet) *options {
 	home, _ := os.UserHomeDir()
 	o := &options{
-		channel:      &choice{value: "terminal", options: []string{"terminal", "telegram"}},
 		allowedUsers: &idList{},
 		memorySystem: &choice{value: "optmem", options: memorySystemNames()},
 	}
 	o.model = fs.String("model", "", summary("model"))
 	o.baseURL = fs.String("base-url", openai.DefaultBaseURL, summary("base-url"))
 	o.system = fs.String("system", "", summary("system"))
-	fs.Var(o.channel, "channel", summary("channel"))
 	fs.Var(o.allowedUsers, "telegram-allowed-users", summary("telegram-allowed-users"))
 	o.configPath = fs.String("config", defaultConfigPath(), `settings file, edited with "steel config"; secrets go in .env beside it`)
 	o.dataDir = fs.String("data", filepath.Join(home, ".steel", "sessions"), summary("data"))
@@ -123,14 +121,6 @@ Example: steel config set base-url http://localhost:11434/v1`,
 		details: `Instructions sent ahead of every conversation. A change applies from
 steel's next start, to saved conversations too.
 Example: steel config set system "Answer briefly."`,
-	},
-	{
-		flag: "channel", path: []string{"channel"},
-		summary: `where to chat: "terminal" or "telegram"`,
-		details: `terminal: chat on stdin/stdout.
-telegram: run a Telegram bot. Needs telegram-bot-token, and
-telegram-allowed-users for anyone to be able to use it.
-Example: steel config set channel telegram`,
 	},
 	{
 		flag: "telegram-allowed-users", path: []string{"telegram", "allowedUsers"},
@@ -212,7 +202,7 @@ need no key can leave it unset.`,
 	},
 	{
 		name: "telegram-bot-token", env: "TELEGRAM_BOT_TOKEN",
-		summary: "Telegram bot token, for channel telegram",
+		summary: "Telegram bot token",
 		details: `Create a bot by messaging @BotFather on Telegram and sending /newbot;
 it replies with a token like 123456789:AAE.... Anyone with the token
 controls the bot: keep it out of chats, scripts and shell history.`,

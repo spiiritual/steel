@@ -110,6 +110,7 @@ func (b *Bot) logf(format string, args ...any) {
 // sender is the part of *agent.Sessions Run uses.
 type sender interface {
 	Send(id, text string)
+	Answer(id, approvalID string, allow bool) bool
 }
 
 var _ sender = (*agent.Sessions)(nil)
@@ -148,7 +149,7 @@ func (b *Bot) run(ctx context.Context, ss sender) error {
 			err := b.api.callRetry(ctx, "getUpdates", getUpdatesParams{
 				Offset:         offset,
 				Timeout:        int(b.pollTimeout / time.Second),
-				AllowedUpdates: []string{"message", "stopped_message_generation"},
+				AllowedUpdates: []string{"message", "stopped_message_generation", "callback_query"},
 			}, &raw, b.pollTimeout+15*time.Second, 0)
 			if ctx.Err() != nil {
 				return nil
@@ -193,6 +194,10 @@ func (b *Bot) run(ctx context.Context, ss sender) error {
 
 // handle routes one update.
 func (b *Bot) handle(ss sender, botName string, u update) {
+	if q := u.CallbackQuery; q != nil {
+		b.answer(ss, q)
+		return
+	}
 	if s := u.StoppedMessageGeneration; s != nil {
 		// Drafts exist only in private chats, whose ID is the user's.
 		if s.Chat.Type == "private" && b.allowed[s.Chat.ID] {
@@ -247,6 +252,46 @@ func (b *Bot) handle(ss sender, botName string, u update) {
 		b.push(id, userSent{})
 		ss.Send(sid, rest)
 	}
+}
+
+// Callback data of approval buttons: a prefix and the request's ID.
+const (
+	allowPrefix  = "allow:"
+	refusePrefix = "refuse:"
+)
+
+// answer handles a press of an approval button. Only allowed users'
+// presses count, so in a group nobody else can approve.
+func (b *Bot) answer(ss sender, q *callbackQuery) {
+	reply := func(text string) {
+		ctx, cancel := context.WithTimeout(b.ctx, requestTimeout)
+		defer cancel()
+		if err := b.api.call(ctx, "answerCallbackQuery", answerCallbackQueryParams{CallbackQueryID: q.ID, Text: text}, nil, requestTimeout); err != nil && b.ctx.Err() == nil {
+			b.logf("answering a button press: %v", err)
+		}
+	}
+	if q.From == nil || !b.allowed[q.From.ID] || q.Message == nil {
+		reply("")
+		return
+	}
+	id, allow := strings.CutPrefix(q.Data, allowPrefix)
+	if !allow {
+		var ok bool
+		if id, ok = strings.CutPrefix(q.Data, refusePrefix); !ok {
+			reply("")
+			return
+		}
+	}
+	chat := q.Message.Chat.ID
+	if ss.Answer(IDPrefix+strconv.FormatInt(chat, 10), id, allow) {
+		reply("") // the request's ApprovalDone updates the message
+		return
+	}
+	// From before a restart, or already answered: drop the stale buttons.
+	reply("This request isn't waiting anymore.")
+	ctx, cancel := context.WithTimeout(b.ctx, requestTimeout)
+	defer cancel()
+	b.api.call(ctx, "editMessageReplyMarkup", editMessageReplyMarkupParams{ChatID: chat, MessageID: q.Message.MessageID}, nil, requestTimeout)
 }
 
 // stop sends a stopping command (/stop or /new) to chat id's session. The

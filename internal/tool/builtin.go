@@ -4,59 +4,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
-	"os"
 	"os/exec"
-	"path/filepath"
 	"syscall"
 	"time"
 )
-
-// readFileMax caps fs.read_file; larger files must be sliced with shell tools.
-const readFileMax = 256 << 10
-
-// ReadFile returns a tool that reads a text file; relative paths resolve against dir.
-func ReadFile(dir string) Tool {
-	type args struct {
-		Path string `json:"path" desc:"Absolute, or relative to the working directory"`
-	}
-	return New("fs.read_file",
-		fmt.Sprintf("Read a regular text file of at most %d KB. Larger files, directories and devices are errors; use shell.bash (head, tail, sed -n, grep, ls) for those. Working directory: %s", readFileMax>>10, dir),
-		func(_ context.Context, a args) (string, error) {
-			path := a.Path
-			if !filepath.IsAbs(path) {
-				path = filepath.Join(dir, path)
-			}
-			// O_NONBLOCK keeps opening a FIFO from blocking; the Stat below
-			// rejects it, and regular files ignore the flag.
-			f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NONBLOCK, 0)
-			if err != nil {
-				return "", err
-			}
-			defer f.Close()
-			fi, err := f.Stat()
-			if err != nil {
-				return "", err
-			}
-			if !fi.Mode().IsRegular() {
-				return "", fmt.Errorf("%s is not a regular file (mode %s); use shell.bash to inspect it", a.Path, fi.Mode().Type())
-			}
-			tooBig := func(size int64) error {
-				return fmt.Errorf("%s is %d bytes, over the %d KB limit; read slices with shell.bash, e.g. head -c, sed -n '1,200p', or grep", a.Path, size, readFileMax>>10)
-			}
-			if fi.Size() > readFileMax {
-				return "", tooBig(fi.Size())
-			}
-			b, err := io.ReadAll(io.LimitReader(f, readFileMax+1))
-			if err != nil {
-				return "", err
-			}
-			if len(b) > readFileMax { // grew since Stat
-				return "", tooBig(int64(len(b)))
-			}
-			return string(b), nil
-		})
-}
 
 var (
 	// bashTimeout bounds a single bash invocation; a var so tests can shorten it.
@@ -81,18 +32,29 @@ type BashResult struct {
 	Truncated bool   `json:"truncated" desc:"Output exceeded the cap; its middle was replaced by a marker stating the omitted byte count"`
 }
 
-// Bash returns a tool that runs a command with `bash -c` in dir.
-func Bash(dir string) Tool {
+// Bash returns a tool that runs a command with `bash -c` in dir. Before
+// running, check lists why the command needs the user's approval; a command
+// with reasons runs only once the approver in the call's context allows it.
+// A nil check approves everything.
+func Bash(dir string, check func(cmd string) []string) Tool {
 	type args struct {
 		Cmd string `json:"cmd"`
 	}
 	return New("shell.bash",
 		fmt.Sprintf("Run a command with bash -c in %s; stdin is empty. A non-zero exit is a normal result, not an error. "+
+			"Commands that are risky (recursive deletes, piping downloads into a shell, git push, sending data, touching steel's own files, …) wait for the user's approval, up to %s; if the user refuses or doesn't answer, the call throws: don't retry the same command, ask the user instead. "+
 			"Output keeps the first %d KB and last %d KB; the middle is replaced by a marker and truncated is true, so filter large output (grep, head, tail) yourself. "+
 			"Throws if the command runs longer than %s; its whole process group is killed. "+
 			"Background processes that keep stdout/stderr open delay the result by %s; redirect their output to a file.",
-			dir, bashOutputHead>>10, bashOutputTail>>10, bashTimeout, bashWaitDelay),
+			dir, ApprovalTimeout, bashOutputHead>>10, bashOutputTail>>10, bashTimeout, bashWaitDelay),
 		func(ctx context.Context, a args) (BashResult, error) {
+			if check != nil {
+				if reasons := check(a.Cmd); len(reasons) > 0 {
+					if err := Approve(ctx, Approval{Tool: "shell.bash", Action: a.Cmd, Reasons: reasons}); err != nil {
+						return BashResult{}, err
+					}
+				}
+			}
 			ctx, cancel := context.WithTimeout(ctx, bashTimeout)
 			defer cancel()
 			c := exec.CommandContext(ctx, "bash", "-c", a.Cmd)
