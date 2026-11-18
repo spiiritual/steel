@@ -14,6 +14,19 @@ cd "$HOME"
 mkdir -p .steel
 [ -e .steel/config.json ] || cp /usr/local/share/steel/config.json .steel/config.json
 
+# v0.2.0 seeded Playwright MCP as the browser, which the image no longer
+# has. Replace that entry only while it's still exactly what was seeded, so
+# a browser server you chose stays yours. The seeded system prompt explains
+# the new browser's bot checks; it's added only if you haven't set one.
+old_browser='{"command":"playwright-mcp","args":["--cdp-endpoint","http://127.0.0.1:9222","--image-responses","omit"]}'
+if [ "$(jq -c '.mcpServers.browser // empty' .steel/config.json 2>/dev/null)" = "$old_browser" ]; then
+	new=$(jq --slurpfile seed /usr/local/share/steel/config.json \
+		'.mcpServers.browser = $seed[0].mcpServers.browser | .system //= $seed[0].system' .steel/config.json) &&
+		printf '%s\n' "$new" >.steel/config.json.new &&
+		mv .steel/config.json.new .steel/config.json &&
+		echo "steel-desktop: switched the browser from Playwright MCP to agent-browser" >&2
+fi
+
 if [ $# -gt 0 ]; then
 	exec steel "$@"
 fi

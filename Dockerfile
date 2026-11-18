@@ -29,9 +29,10 @@ FROM debian:trixie-slim
 
 # Desktop: Xvfb (a screen with no monitor), openbox, x11vnc and noVNC to
 # watch it from a browser, xdotool and scrot for later screen control.
-# Browser: Chromium, driven over CDP by Playwright MCP (needs Node).
+# Browser: Chromium, driven over CDP by agent-browser.
 # Fonts: so pages in any script render as text, not boxes.
-# The rest: tools the agent and you expect on a Linux box.
+# The rest: tools the agent and you expect on a Linux box, and Node for
+# MCP servers you add.
 RUN apt-get update && apt-get install -y --no-install-recommends \
       tini ca-certificates \
       xvfb x11vnc openbox novnc websockify xdotool scrot \
@@ -40,9 +41,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       curl git jq less procps python3 \
     && rm -rf /var/lib/apt/lists/*
 
-# Playwright MCP attaches to the desktop's Chromium, so it needs no browser
-# of its own.
-RUN PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1 npm install -g @playwright/mcp@0.0.85 \
+# agent-browser attaches to the desktop's Chromium (agent-browser.json), so
+# it needs no browser of its own. Its snapshots come from Chrome's
+# accessibility tree, which reaches into cross-origin frames and closed
+# shadow roots: that's what lets the agent see and click checks like
+# Cloudflare's "Verify you are human", which Playwright MCP's snapshots
+# leave out.
+RUN npm install -g agent-browser@0.43.0 \
     && npm cache clean --force
 
 # Opening the noVNC page connects straight away and scales the desktop to
@@ -54,7 +59,7 @@ RUN useradd --create-home --uid 1000 --shell /bin/bash steel \
     && mkdir -p /tmp/.X11-unix && chmod 1777 /tmp/.X11-unix
 
 COPY docker/entrypoint.sh /usr/local/bin/steel-entrypoint
-COPY docker/config.json /usr/local/share/steel/config.json
+COPY docker/config.json docker/agent-browser.json /usr/local/share/steel/
 COPY --from=steel /steel /usr/local/bin/steel
 
 # STEEL_CONTAINER makes `steel update` and `steel rollback` refuse: here a
