@@ -39,7 +39,7 @@ var memorySystems = map[string]func(o *options, summarizer llm.Provider) (opened
 		if err != nil {
 			return openedMemory{}, err
 		}
-		return openedMemory{m, optmem.SystemPrompt(*o.system, m.EntryChars()), optmem.Tools(m), m.Close}, nil
+		return openedMemory{m, optmem.SystemPrompt(systemPrompt(*o.system), m.EntryChars()), optmem.Tools(m), m.Close}, nil
 	},
 }
 

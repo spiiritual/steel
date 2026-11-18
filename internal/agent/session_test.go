@@ -659,3 +659,103 @@ func TestApprovalRoundTrip(t *testing.T) {
 		t.Errorf("outcome %s, want expired", o)
 	}
 }
+
+// A tool's secret request reaches the channel as an event; the value the
+// channel provides reaches the tool, and only one request waits at a time.
+func TestSecretRoundTrip(t *testing.T) {
+	h := newHarness(t, Config{}, func(int, context.Context, llm.Request) (llm.Message, error) { return text("ok"), nil })
+	h.ss.Send("c", "hi")
+	h.waitTurn()
+
+	events := func() []Event {
+		h.mu.Lock()
+		defer h.mu.Unlock()
+		return append([]Event(nil), h.events...)
+	}
+	request := func() SecretRequest {
+		var r SecretRequest
+		waitFor(t, func() bool {
+			for _, e := range events() {
+				if e, ok := e.(SecretRequest); ok {
+					r = e
+				}
+			}
+			return r.ID != ""
+		})
+		h.mu.Lock()
+		h.events = nil
+		h.mu.Unlock()
+		return r
+	}
+	done := func(id string) SecretDone {
+		var d SecretDone
+		waitFor(t, func() bool {
+			for _, e := range events() {
+				if e, ok := e.(SecretDone); ok && e.ID == id {
+					d = e
+					return true
+				}
+			}
+			return false
+		})
+		return d
+	}
+	type result struct {
+		saved string
+		err   error
+	}
+	// ask asks for GH_TOKEN, saving the value unless saveErr is set.
+	ask := func(saveErr error) chan result {
+		c := make(chan result, 1)
+		go func() {
+			var saved string
+			err := h.box(0).hooks.AskSecret(context.Background(), "GH_TOKEN", "GitHub", func(v string) error {
+				if saveErr != nil {
+					return saveErr
+				}
+				saved = v
+				return nil
+			})
+			c <- result{saved, err}
+		}()
+		return c
+	}
+
+	res := ask(nil)
+	r := request()
+	if r.Name != "GH_TOKEN" || r.Purpose != "GitHub" {
+		t.Errorf("request %+v", r)
+	}
+	if err := h.box(0).hooks.AskSecret(context.Background(), "OTHER", "x", func(string) error { return nil }); err == nil {
+		t.Error("a second request was made while one was waiting")
+	}
+	if !h.ss.ProvideSecret("c", r.ID, "ghp_value") {
+		t.Fatal("value not accepted")
+	}
+	if got := <-res; got.saved != "ghp_value" || got.err != nil {
+		t.Errorf("tool got %+v", got)
+	}
+	if d := done(r.ID); d.Outcome != SecretReceived {
+		t.Errorf("done %+v", d)
+	}
+
+	// The user is told "saved" only once it is.
+	res = ask(errors.New("disk full"))
+	r = request()
+	h.ss.ProvideSecret("c", r.ID, "ghp_value")
+	if got := <-res; got.err == nil || !strings.Contains(got.err.Error(), "disk full") {
+		t.Errorf("failed save: tool got %+v", got)
+	}
+	if d := done(r.ID); d.Outcome != SecretNotSaved || d.Problem != "disk full" {
+		t.Errorf("failed save: done %+v", d)
+	}
+
+	res = ask(nil)
+	r = request()
+	if !h.ss.CancelSecret("c", r.ID) {
+		t.Fatal("cancel not accepted")
+	}
+	if got := <-res; got.err == nil || got.saved != "" {
+		t.Errorf("declined: tool got %+v", got)
+	}
+}

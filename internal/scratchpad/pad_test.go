@@ -221,6 +221,8 @@ func TestStopHaltsRunningWorkAndReportsLostState(t *testing.T) {
 	}
 }
 
+// A user's reset ends a running script, telling the model it was the user,
+// so it doesn't redo what they ended.
 func TestResetEndsRunningScript(t *testing.T) {
 	p := New(testTools(), Options{Wait: 5 * time.Second})
 	defer p.Close()
@@ -231,7 +233,7 @@ func TestResetEndsRunningScript(t *testing.T) {
 	}()
 	start := time.Now()
 	r := run(t, p, `while (true) {}`)
-	if !strings.Contains(r.Error, "reset") || time.Since(start) > time.Second {
+	if !strings.Contains(r.Error, "the user reset") || !strings.Contains(r.Error, "Don't redo it") || time.Since(start) > time.Second {
 		t.Errorf("Run = %+v after %v; want prompt reset error", r, time.Since(start))
 	}
 }

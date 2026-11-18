@@ -21,6 +21,12 @@ type Tool struct {
 	// Run executes the tool. The result must be JSON-serializable; a string
 	// reaches scripts as a JS string, anything else as the equivalent JS value.
 	Run func(ctx context.Context, args json.RawMessage) (any, error)
+	// AcceptsSecrets marks tools that take secrets out of steel, like a
+	// command or an MCP server. Only their calls get secret placeholders
+	// in the arguments replaced by values, once the user approves; any
+	// other tool gets the placeholders as written, so steel's own tools
+	// (memory, schedules) never store a value the model could read back.
+	AcceptsSecrets bool
 }
 
 // Registry is an ordered set of tools.

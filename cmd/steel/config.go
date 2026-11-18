@@ -23,6 +23,7 @@ import (
 	"github.com/spiiritual/steel/internal/datafile"
 	"github.com/spiiritual/steel/internal/llm/openai"
 	"github.com/spiiritual/steel/internal/mcp"
+	"github.com/spiiritual/steel/internal/secret"
 )
 
 // options are steel's flags. Each one in settings also has a saved value in
@@ -73,10 +74,67 @@ func defaultConfigPath() string {
 	return filepath.Join(home, ".steel", "config.json")
 }
 
-// dotenvPath is the .env beside config.json, so a test config elsewhere
-// keeps its own secrets.
+// dotenvPath is the .env beside config.json, holding steel's own tokens
+// (and settings, if put there), so a test config elsewhere keeps its own.
 func dotenvPath(configPath string) string {
 	return filepath.Join(filepath.Dir(configPath), ".env")
+}
+
+// secretsPath is secrets.env beside config.json: the user's secrets, for
+// tools (tools.secrets) and mcpServers (${NAME}). Kept apart from .env so
+// steel's own variables are never taken for the user's secrets.
+func secretsPath(configPath string) string {
+	return filepath.Join(filepath.Dir(configPath), "secrets.env")
+}
+
+// secretPath is the file secret variable envVar is saved in.
+func secretPath(configPath, envVar string) string {
+	if isOwn(envVar) {
+		return dotenvPath(configPath)
+	}
+	return secretsPath(configPath)
+}
+
+// isOwn reports whether envVar is one of steel's own variables: a token
+// or a setting's.
+func isOwn(envVar string) bool {
+	return slices.ContainsFunc(secrets, func(s ownSecret) bool { return s.env == envVar }) ||
+		slices.ContainsFunc(settings, func(s setting) bool { return s.env == envVar })
+}
+
+// moveUserSecrets moves variables that aren't steel's own from .env, where
+// older versions kept them, to secrets.env, returning their names.
+func moveUserSecrets(configPath string) ([]string, error) {
+	env, err := secret.ReadDotenv(dotenvPath(configPath))
+	if err != nil {
+		return nil, err
+	}
+	var moved []string
+	for name := range env.Vars() {
+		if !isOwn(name) {
+			moved = append(moved, name)
+		}
+	}
+	if len(moved) == 0 {
+		return nil, nil
+	}
+	slices.Sort(moved)
+	user, err := secret.ReadDotenv(secretsPath(configPath))
+	if err != nil {
+		return nil, err
+	}
+	have, vars := user.Vars(), env.Vars()
+	for _, name := range moved {
+		if _, ok := have[name]; !ok { // secrets.env's is newer
+			user.Set(name, vars[name])
+		}
+		env.Unset(name)
+	}
+	// secrets.env first: if writing .env fails, nothing is lost.
+	if err := user.Write(secretsPath(configPath)); err != nil {
+		return nil, err
+	}
+	return moved, env.Write(dotenvPath(configPath))
 }
 
 // setting is a flag whose value config.json can save. Its docs are the only
@@ -182,17 +240,17 @@ Example: steel config set drain 30s`,
 	},
 }
 
-// secret is a token steel itself uses, saved in .env.
-type secret struct {
+// ownSecret is a token steel itself uses, saved in .env.
+type ownSecret struct {
 	name    string // its name in "steel config"
 	env     string // its variable in .env or the environment
 	summary string
 	details string
 }
 
-// secrets steel itself uses. Any other upper-case name is a secret too, for
-// mcpServers entries to use as ${NAME}.
-var secrets = []secret{
+// secrets steel itself uses. Any other upper-case name is a user secret,
+// saved in secrets.env, for tools and mcpServers entries (${NAME}).
+var secrets = []ownSecret{
 	{
 		name: "openai-api-key", env: "OPENAI_API_KEY",
 		summary: "API key for base-url",
@@ -217,15 +275,14 @@ func settingNamed(name string) (setting, bool) {
 	return settings[i], true
 }
 
-// secretVar returns the .env variable a "steel config" name refers to.
+// secretVar returns the variable a "steel config" secret name refers to.
 func secretVar(name string) (string, bool) {
 	for _, s := range secrets {
 		if s.name == name {
 			return s.env, true
 		}
 	}
-	// Upper case only, so a mistyped setting name isn't saved as a secret.
-	return name, envName.MatchString(name) && name == strings.ToUpper(name)
+	return name, secret.ValidName(name) == nil
 }
 
 // unknownName explains a name that's neither a setting nor a secret.
@@ -269,18 +326,30 @@ func editDistance(a, b string) int {
 }
 
 // environment is where steel looks up variables: its own environment, then
-// .env. It's a snapshot, so steel can remove its tokens from the real
-// environment and still expand them in mcpServers.
+// .env, and for mcpServers also secrets.env. It's a snapshot, so steel can
+// remove its tokens from the real environment and still expand them in
+// mcpServers.
 type environment struct {
-	os, dotenv map[string]string
+	os, dotenv, secrets map[string]string
 }
 
 func loadEnvironment(configPath string) (environment, error) {
-	d, err := readDotenv(dotenvPath(configPath))
+	moved, err := moveUserSecrets(configPath)
+	if err != nil {
+		return environment{}, fmt.Errorf("moving secrets from .env to secrets.env: %w", err)
+	}
+	for _, name := range moved {
+		fmt.Fprintf(os.Stderr, "steel: moved %s from %s to %s\n", name, dotenvPath(configPath), secretsPath(configPath))
+	}
+	d, err := secret.ReadDotenv(dotenvPath(configPath))
 	if err != nil {
 		return environment{}, err
 	}
-	e := environment{os: map[string]string{}, dotenv: d.vars()}
+	user, err := secret.ReadDotenv(secretsPath(configPath))
+	if err != nil {
+		return environment{}, err
+	}
+	e := environment{os: map[string]string{}, dotenv: d.Vars(), secrets: user.Vars()}
 	for _, kv := range os.Environ() {
 		k, v, _ := strings.Cut(kv, "=")
 		e.os[k] = v
@@ -300,13 +369,25 @@ func (e environment) lookup(name string) (string, bool) {
 	return v, ok
 }
 
-// source says where lookup finds name.
+// expand looks name up for an mcpServers ${NAME}: like lookup, then the
+// user's secrets.
+func (e environment) expand(name string) (string, bool) {
+	if v, ok := e.lookup(name); ok {
+		return v, true
+	}
+	v, ok := e.secrets[name]
+	return v, ok
+}
+
+// source says where expand finds name.
 func (e environment) source(name string) string {
 	switch {
 	case e.os[name] != "":
 		return "environment"
 	case e.dotenv[name] != "":
 		return ".env"
+	case e.secrets[name] != "":
+		return "secrets.env"
 	}
 	return ""
 }
@@ -488,12 +569,13 @@ const configUsage = `usage: steel config [-config path] [command]
   steel config                     list settings and secrets, and where each comes from
   steel config help [name]         explain every setting and secret, or one
   steel config set <name> <value>  save a setting in config.json
-  steel config set <secret>        save a secret in .env, typed at a hidden prompt or piped in
+  steel config set <secret>        save a secret, typed at a hidden prompt or piped in:
+                                   steel's own in .env, any other NAME in secrets.env
   steel config unset <name>        remove a saved setting or secret
   steel config edit                open config.json in $EDITOR, e.g. to add mcpServers
 
 Each setting is also a flag (steel -help) that overrides it for one run.
-Variables in steel's environment take precedence over .env.
+Variables in steel's environment take precedence over .env and secrets.env.
 
 `
 
@@ -535,7 +617,7 @@ func showConfig(c *configFile) error {
 	}
 	defaults := flag.NewFlagSet("", flag.ContinueOnError)
 	defineFlags(defaults)
-	fmt.Printf("settings: %s\nsecrets:  %s\n\n", c.path, dotenvPath(c.path))
+	fmt.Printf("settings: %s\ntokens:   %s\nsecrets:  %s\n\n", c.path, dotenvPath(c.path), secretsPath(c.path))
 	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
 	for _, s := range settings {
 		text, from, err := s.value(c, env)
@@ -548,15 +630,11 @@ func showConfig(c *configFile) error {
 		fmt.Fprintf(w, "%s\t%s\t%s\t%s\n", s.flag, shorten(text, 40), from, s.summary)
 	}
 	fmt.Fprintln(w, "\t\t\t")
-	known := map[string]bool{}
 	for _, s := range secrets {
-		known[s.env] = true
 		fmt.Fprintf(w, "%s\t%s\t%s\t%s\n", s.name, secretState(env, s.env), s.env, s.summary)
 	}
-	for _, k := range slices.Sorted(maps.Keys(env.dotenv)) {
-		if !known[k] {
-			fmt.Fprintf(w, "%s\t%s\t\t%s\n", k, secretState(env, k), "for mcpServers as ${"+k+"}")
-		}
+	for _, k := range slices.Sorted(maps.Keys(env.secrets)) {
+		fmt.Fprintf(w, "%s\t%s\t\t%s\n", k, secretState(env, k), "for tools, and mcpServers as ${"+k+"}")
 	}
 	w.Flush()
 	servers, err := c.mcpServers()
@@ -611,16 +689,16 @@ func showHelp(c *configFile, names []string) error {
 		if !ok {
 			return unknownName(name)
 		}
-		doc := "A secret for mcpServers entries to use as ${" + envVar + "}."
-		if j := slices.IndexFunc(secrets, func(s secret) bool { return s.env == envVar }); j >= 0 {
+		doc := "A secret for tools (as {{secret:" + envVar + "}}) and mcpServers entries (as ${" + envVar + "})."
+		if j := slices.IndexFunc(secrets, func(s ownSecret) bool { return s.env == envVar }); j >= 0 {
 			doc = secrets[j].summary + ".\n" + secrets[j].details
 		}
-		fmt.Printf("%s  (.env: %s)\n", name, envVar)
+		fmt.Printf("%s  (%s: %s)\n", name, filepath.Base(secretPath(c.path, envVar)), envVar)
 		printIndented(doc)
 		printIndented(fmt.Sprintf("Now: %s\nSet it: steel config set %s", secretState(env, envVar), name))
 	}
 	if all {
-		fmt.Println("\nAny other upper-case NAME is a secret too: steel config set NAME saves it in .env,\nand mcpServers entries in config.json can use it as ${NAME}.")
+		fmt.Println("\nAny other upper-case NAME is a secret too: steel config set NAME saves it in secrets.env,\nfor tools to use and mcpServers entries in config.json as ${NAME}.")
 	}
 	return nil
 }
@@ -675,17 +753,17 @@ func setConfig(c *configFile, name string, value []string) error {
 	if len(value) != 0 {
 		return fmt.Errorf("type the secret at the prompt or pipe it in, so it stays out of shell history: steel config set %s", name)
 	}
-	secret, err := readSecret(envVar)
+	tok, err := readSecret(envVar)
 	if err != nil {
 		return err
 	}
-	path := dotenvPath(c.path)
-	d, err := readDotenv(path)
+	path := secretPath(c.path, envVar)
+	d, err := secret.ReadDotenv(path)
 	if err != nil {
 		return err
 	}
-	d.set(envVar, secret)
-	if err := d.write(path); err != nil {
+	d.Set(envVar, tok)
+	if err := d.Write(path); err != nil {
 		return err
 	}
 	fmt.Printf("%s saved in %s\n", envVar, path)
@@ -730,16 +808,16 @@ func unsetConfig(c *configFile, name string) error {
 	if !ok {
 		return unknownName(name)
 	}
-	path := dotenvPath(c.path)
-	d, err := readDotenv(path)
+	path := secretPath(c.path, envVar)
+	d, err := secret.ReadDotenv(path)
 	if err != nil {
 		return err
 	}
-	if !d.unset(envVar) {
+	if !d.Unset(envVar) {
 		fmt.Printf("%s wasn't in %s\n", envVar, path)
 		return nil
 	}
-	if err := d.write(path); err != nil {
+	if err := d.Write(path); err != nil {
 		return err
 	}
 	fmt.Printf("%s removed from %s\n", envVar, path)

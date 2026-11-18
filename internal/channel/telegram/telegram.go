@@ -78,7 +78,8 @@ const greeting = "Hi, I'm steel. Send me a message to start.\n\n" +
 	"/stop stops what I'm doing\n" +
 	"/reset clears my scratchpad\n" +
 	"/new starts a new conversation\n" +
-	"/schedules lists what's scheduled"
+	"/schedules lists what's scheduled\n" +
+	"/secret NAME saves a secret for tools, out of the model's sight"
 
 // Options configure a Bot.
 type Options struct {
@@ -96,6 +97,7 @@ type Bot struct {
 	api       *client
 	allowed   map[int64]bool
 	schedules Schedules // nil: no /schedules
+	secrets   Secrets   // nil: /secret can't save
 	log       io.Writer
 	logMu     sync.Mutex
 
@@ -107,6 +109,7 @@ type Bot struct {
 	sendAttempts   int           // give up on a message after this many transient failures
 	closeTimeout   time.Duration // how long Close waits for pending messages
 	chatIdle       time.Duration // an idle renderer exits after this long
+	secretTimeout  time.Duration // how long /secret waits for the value
 
 	// ctx bounds outgoing messages; Close cancels it.
 	ctx    context.Context
@@ -117,7 +120,8 @@ type Bot struct {
 
 	mu        sync.Mutex
 	chats     map[place]*chat // renderers; each removes itself once idle
-	unknown   map[int64]bool  // user IDs already logged as not allowed
+	waits     map[place]*secretWait
+	unknown   map[int64]bool // user IDs already logged as not allowed
 	closing   bool
 	closingCh chan struct{}
 	wg        sync.WaitGroup
@@ -136,7 +140,9 @@ func New(o Options) *Bot {
 		sendAttempts:   5,
 		closeTimeout:   5 * time.Second,
 		chatIdle:       10 * time.Minute,
+		secretTimeout:  5 * time.Minute,
 		chats:          map[place]*chat{},
+		waits:          map[place]*secretWait{},
 		unknown:        map[int64]bool{},
 		closingCh:      make(chan struct{}),
 	}
@@ -165,6 +171,8 @@ func (b *Bot) logf(format string, args ...any) {
 type sender interface {
 	Send(id, text string)
 	Answer(id, approvalID string, allow bool) bool
+	ProvideSecret(id, requestID, value string) bool
+	CancelSecret(id, requestID string) bool
 }
 
 var _ sender = (*agent.Sessions)(nil)
@@ -290,6 +298,9 @@ func (b *Bot) handle(ss sender, botName string, u update) {
 		}
 		return
 	}
+	if b.captureSecret(ss, p, m) {
+		return
+	}
 	cmd, rest, mine := command(m.Text, botName)
 	if !mine {
 		return // a command for another bot in the same group
@@ -301,6 +312,9 @@ func (b *Bot) handle(ss sender, botName string, u update) {
 		return
 	case "/schedules":
 		b.push(p, b.scheduleList(p.chat))
+		return
+	case "/secret":
+		b.askSecret(p, strings.TrimSpace(rest))
 		return
 	case "/stop", "/new":
 		b.stop(ss, p, cmd)
@@ -332,6 +346,9 @@ func (b *Bot) commands() []botCommand {
 	}
 	if b.schedules != nil {
 		cs = append(cs, botCommand{"schedules", "List and cancel schedules"})
+	}
+	if b.secrets != nil {
+		cs = append(cs, botCommand{"secret", "Save a secret for tools: /secret NAME"})
 	}
 	return cs
 }
@@ -368,6 +385,14 @@ func (b *Bot) answer(ss sender, q *callbackQuery) {
 		b.cancelSchedule(q, id, reply)
 		return
 	}
+	if id, ok := strings.CutPrefix(q.Data, cancelSecretPrefix); ok {
+		if b.cancelSecret(ss, placeOf(q.Message), id) {
+			reply("") // the request's SecretDone updates the message
+			return
+		}
+		b.dropButtons(q, reply)
+		return
+	}
 	id, allow := strings.CutPrefix(q.Data, allowPrefix)
 	if !allow {
 		var ok bool
@@ -376,16 +401,20 @@ func (b *Bot) answer(ss sender, q *callbackQuery) {
 			return
 		}
 	}
-	chat := q.Message.Chat.ID
 	if ss.Answer(placeOf(q.Message).sessionID(), id, allow) {
 		reply("") // the request's ApprovalDone updates the message
 		return
 	}
-	// From before a restart, or already answered: drop the stale buttons.
+	b.dropButtons(q, reply)
+}
+
+// dropButtons answers a press on a request that isn't waiting anymore,
+// from before a restart or already answered, and removes its buttons.
+func (b *Bot) dropButtons(q *callbackQuery, reply func(string)) {
 	reply("This request isn't waiting anymore.")
 	ctx, cancel := context.WithTimeout(b.ctx, requestTimeout)
 	defer cancel()
-	b.api.call(ctx, "editMessageReplyMarkup", editMessageReplyMarkupParams{ChatID: chat, MessageID: q.Message.MessageID}, nil, requestTimeout)
+	b.api.call(ctx, "editMessageReplyMarkup", editMessageReplyMarkupParams{ChatID: q.Message.Chat.ID, MessageID: q.Message.MessageID}, nil, requestTimeout)
 }
 
 // stop sends a stopping command (/stop or /new) to p's session. p's
@@ -431,9 +460,19 @@ func command(text, botName string) (cmd, rest string, mine bool) {
 // Emit renders one session event in its chat. It never blocks on the
 // network and is safe for concurrent use.
 func (b *Bot) Emit(id string, e agent.Event) {
-	if p, ok := parsePlace(id); ok {
-		b.push(p, e)
+	p, ok := parsePlace(id)
+	if !ok {
+		return
 	}
+	// The wait starts before the prompt shows, so the value can't arrive
+	// first and go to the model.
+	switch e := e.(type) {
+	case agent.SecretRequest:
+		b.waitSecret(p, &secretWait{id: e.ID, name: e.Name})
+	case agent.SecretDone:
+		b.takeSecret(p, e.ID)
+	}
+	b.push(p, e)
 }
 
 // push queues e for p's renderer, starting it if needed.

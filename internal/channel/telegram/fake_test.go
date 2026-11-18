@@ -263,6 +263,21 @@ func (s *fakeSessions) Answer(id, approvalID string, allow bool) bool {
 	return strings.HasPrefix(approvalID, "live")
 }
 
+// ProvideSecret and CancelSecret record the answer like Answer.
+func (s *fakeSessions) ProvideSecret(id, requestID, value string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.sent = append(s.sent, fmt.Sprintf("%s: secret %s %q", id, requestID, value))
+	return strings.HasPrefix(requestID, "live")
+}
+
+func (s *fakeSessions) CancelSecret(id, requestID string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.sent = append(s.sent, fmt.Sprintf("%s: cancel secret %s", id, requestID))
+	return strings.HasPrefix(requestID, "live")
+}
+
 func (s *fakeSessions) got() []string {
 	s.mu.Lock()
 	defer s.mu.Unlock()

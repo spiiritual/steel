@@ -40,12 +40,13 @@ func Bash(dir string, check func(cmd string) []string) Tool {
 	type args struct {
 		Cmd string `json:"cmd"`
 	}
-	return New("shell.bash",
+	t := New("shell.bash",
 		fmt.Sprintf("Run a command with bash -c in %s; stdin is empty. A non-zero exit is a normal result, not an error. "+
 			"Commands that are risky (recursive deletes, piping downloads into a shell, git push, sending data, touching steel's own files, …) wait for the user's approval, up to %s; if the user refuses or doesn't answer, the call throws: don't retry the same command, ask the user instead. "+
 			"Output keeps the first %d KB and last %d KB; the middle is replaced by a marker and truncated is true, so filter large output (grep, head, tail) yourself. "+
 			"Throws if the command runs longer than %s; its whole process group is killed. "+
-			"Background processes that keep stdout/stderr open delay the result by %s; redirect their output to a file.",
+			"Background processes that keep stdout/stderr open delay the result by %s; redirect their output to a file. "+
+			"To use a secret (API token, password), put its placeholder from tools.secrets.get in cmd; the command then always waits for the user's approval.",
 			dir, ApprovalTimeout, bashOutputHead>>10, bashOutputTail>>10, bashTimeout, bashWaitDelay),
 		func(ctx context.Context, a args) (BashResult, error) {
 			if check != nil {
@@ -81,6 +82,8 @@ func Bash(dir string, check func(cmd string) []string) Tool {
 			}
 			return res, nil
 		})
+	t.AcceptsSecrets = true
+	return t
 }
 
 // cappedWriter keeps the first bashOutputHead and last bashOutputTail bytes

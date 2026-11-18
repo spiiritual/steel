@@ -129,6 +129,25 @@ func (ss *Sessions) Answer(id, approvalID string, allow bool) bool {
 	return ok && s.answer(approvalID, allow)
 }
 
+// ProvideSecret passes the value the user entered for a SecretRequest from
+// session id, reporting whether the request was still waiting for it.
+func (ss *Sessions) ProvideSecret(id, requestID, value string) bool {
+	return ss.answerSecret(id, requestID, secretAnswer{value: value, ok: true})
+}
+
+// CancelSecret declines a SecretRequest from session id, reporting whether
+// it was still waiting.
+func (ss *Sessions) CancelSecret(id, requestID string) bool {
+	return ss.answerSecret(id, requestID, secretAnswer{})
+}
+
+func (ss *Sessions) answerSecret(id, requestID string, a secretAnswer) bool {
+	ss.mu.Lock()
+	s, ok := ss.m[id]
+	ss.mu.Unlock()
+	return ok && s.answerSecret(requestID, a)
+}
+
 // get returns id's session, creating it if needed; nil after Close.
 func (ss *Sessions) get(id string) *Session {
 	ss.mu.Lock()

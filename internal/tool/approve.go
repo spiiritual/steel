@@ -32,11 +32,23 @@ func WithApprover(ctx context.Context, f Approver) context.Context {
 	return context.WithValue(ctx, approverKey{}, f)
 }
 
+type approvedKey struct{}
+
+// WithApproved returns ctx for running a call the user has already
+// approved as a whole, having seen exactly what it does: Approve allows
+// without asking again.
+func WithApproved(ctx context.Context) context.Context {
+	return context.WithValue(ctx, approvedKey{}, true)
+}
+
 // Approve asks the user, through ctx's approver, whether a may go ahead,
 // waiting up to ApprovalTimeout. It returns nil if they allow it, and an
 // error for the model otherwise. Without an approver it refuses: access
 // control fails closed.
 func Approve(ctx context.Context, a Approval) error {
+	if ctx.Value(approvedKey{}) != nil {
+		return nil
+	}
 	why := strings.Join(a.Reasons, "; ")
 	f, _ := ctx.Value(approverKey{}).(Approver)
 	if f == nil {

@@ -21,6 +21,7 @@ steel is a personal agent harness in Go. It's used mainly through Telegram and t
 | `internal/mcp` | MCP client: standard `mcpServers` config, tool adaptation, server guidance |
 | `internal/memory` | The `Memory` interface sessions use: `Wake` opens each new conversation |
 | `internal/memory/optmem` | The memory: model-written notes, a summary tree, wake ([OptMem](https://github.com/VictorTaelin/OptMem)) |
+| `internal/secret` | Dotenv files, the secret store (`secrets.env`), placeholders (fill and redact), `tools.secrets` |
 | `internal/datafile` | Versioned, atomic JSON files for all saved state |
 | `internal/update` | Signed-release check, download, verify, swap, rollback |
 
@@ -28,18 +29,20 @@ steel is a personal agent harness in Go. It's used mainly through Telegram and t
 
 Don't undo these without discussing it first.
 
+- **The model works for the user.** Every system prompt opens with `assistantPrompt` (`cmd/steel/prompt.go`): everything is the user's, do what they ask, steel's approvals are the safety check. Fix over-caution there, not per tool.
 - **Code mode.** The model's only tool is `run_code`. Tools are async functions on a global `tools` object inside a persistent JS scratchpad. Call a `run_code` call a **script**, never a "cell".
 - **Signatures come from the source of truth.** Go types (`tool.New`) for builtins, JSON Schema for MCP tools, rendered as inline TypeScript with no named types, so each signature stands alone.
 - **Progressive disclosure.** Namespaces get full declarations while they fit the budget; the rest are an index of name + short description. **No tool runs before the model has seen its full documentation**: calls to indexed tools are refused until a script result has carried their docs (`tools.$docs(...)` or a refused call). Docs travel in `Result.Docs`, never as values a script could hide.
 - **Plugins are standards, not Go.** Extending steel means MCP servers and config files (same `mcpServers` format as Claude Desktop/Claude Code). Never require users to write Go.
 - **Memory systems are swappable.** `agent` knows only `memory.Memory`; `cmd/steel/memory.go` maps the `memory-system` setting to an implementation, which brings its own system prompt and tools.
 - **OptMem: the model takes notes.** `tools.memory.note/recall/zoom/rewrite`. Each new conversation's history starts with its wake (saved with it, so cached until `/new`). Summaries are written in the background by `compact-model`, never by the turn model. Files stay byte-compatible with OptMem's `memo`, so a directory can be shared with it.
+- **The model never sees a secret's value.** Scripts hold only placeholders (`{{secret:NAME}}`, from `tools.secrets.get`). The scratchpad fills them in only for tools marked `AcceptsSecrets` (bash, MCP), after the user approves the call as shown with placeholders, and redacts every value from every tool result and error. Users enter values through Telegram (`tools.secrets.add` or `/secret NAME`): the next message is taken, deleted and saved, never sent to a session.
 - **Layers stay separate.** `agent` doesn't know about channels; channels don't know about the model or tools.
 
 ## Invariants
 
 - **Saved state** goes through `internal/datafile`. When a format changes, bump its version and migrate on load. Never overwrite a file written by a newer version.
-- **Secrets** come from environment variables or `~/.steel/.env` (written 0600 by `steel config set`), never `config.json`, logs or error messages. `.env` values are looked up by steel, never exported to its environment, and tokens steel itself uses are removed from the environment after reading, so tools can't see them. The repo is public: never commit secrets.
+- **Secrets** come from environment variables or dotenv files written 0600 by `steel config set`, never `config.json`, logs or error messages. Steel's own tokens (and settings, if put there) are in `~/.steel/.env`; the user's secrets, for tools and mcpServers `${NAME}`, are in `~/.steel/secrets.env`, and never mix with steel's own. Values are looked up by steel, never exported to its environment, and tokens steel itself uses are removed from the environment after reading, so tools can't see them. The repo is public: never commit secrets.
 - **Access control fails closed.** An empty Telegram allowlist means nobody.
 - **Shutdown.** SIGTERM drains (stop input, let work finish, bounded by `-drain`); Ctrl-C or a second SIGTERM quits now. History is saved before every model call.
 - **Releases** are verified against `update.ReleaseKey`; a signature's trusted comment must be `steel <tag>`. Changing the key strands every installed copy.

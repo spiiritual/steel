@@ -18,6 +18,7 @@
 package scratchpad
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -33,6 +34,7 @@ import (
 	"github.com/dop251/goja"
 	"github.com/dop251/goja_nodejs/eventloop"
 
+	"github.com/spiiritual/steel/internal/secret"
 	"github.com/spiiritual/steel/internal/tool"
 )
 
@@ -95,6 +97,14 @@ type Options struct {
 	Approver tool.Approver
 	// Caller names the session the pad belongs to, for tools (tool.Caller).
 	Caller string
+	// Secrets, if set, keeps secret values out of scripts: placeholders in
+	// the arguments of tools that accept secrets (tool.Tool.AcceptsSecrets)
+	// are filled in once the user approves the call, and values in every
+	// tool's result or error become placeholders again.
+	Secrets *secret.Store
+	// SecretAsker, if set, is how tools ask the user to enter a secret
+	// (tool.AskSecret).
+	SecretAsker tool.SecretAsker
 }
 
 // Result is the outcome of one script.
@@ -181,9 +191,12 @@ type Pad struct {
 
 // runtime is one generation of the pad; resets replace it.
 type runtime struct {
-	loop   *eventloop.EventLoop
-	vm     *goja.Runtime // only for Interrupt; all other use happens on the loop
-	dead   chan struct{} // closed when this runtime is stopped
+	loop *eventloop.EventLoop
+	vm   *goja.Runtime // only for Interrupt; all other use happens on the loop
+	dead chan struct{} // closed when this runtime is stopped
+	// cause is why the runtime was stopped. Set under Pad.mu before the
+	// runtime is swapped out, so before dead closes.
+	cause  string
 	ctx    context.Context
 	cancel context.CancelFunc // cancels tool calls when stopped
 	active atomic.Int32       // scripts started and not yet settled
@@ -226,6 +239,9 @@ func (p *Pad) newRuntime() *runtime {
 	}
 	if p.opts.Caller != "" {
 		ctx = tool.WithCaller(ctx, p.opts.Caller)
+	}
+	if p.opts.SecretAsker != nil {
+		ctx = tool.WithSecretAsker(ctx, p.opts.SecretAsker)
 	}
 	rt.ctx, rt.cancel = context.WithCancel(ctx)
 	rt.loop.Start()
@@ -288,11 +304,20 @@ func (rt *runtime) stop(reason string) {
 	}
 }
 
+// Why a runtime was stopped; the first two are the user's doing.
+const (
+	causeStop  = "stopped"
+	causeReset = "scratchpad reset"
+	causeClose = "scratchpad closed"
+)
+
 // swapLocked replaces the runtime and drops all jobs, returning the old
-// runtime for the caller to stop after unlocking. Requires p.mu.
-func (p *Pad) swapLocked() *runtime {
+// runtime, marked with cause, for the caller to stop after unlocking.
+// Requires p.mu.
+func (p *Pad) swapLocked(cause string) *runtime {
 	clear(p.jobs)
 	old := p.rt
+	old.cause = cause
 	p.rt = p.newRuntime()
 	return old
 }
@@ -309,9 +334,9 @@ func (p *Pad) Stop() bool {
 		p.mu.Unlock()
 		return false
 	}
-	old := p.swapLocked()
+	old := p.swapLocked(causeStop)
 	p.mu.Unlock()
-	old.stop("stopped")
+	old.stop(old.cause)
 	return true
 }
 
@@ -332,9 +357,9 @@ func (p *Pad) Reset() {
 		p.mu.Unlock()
 		return
 	}
-	old := p.swapLocked()
+	old := p.swapLocked(causeReset)
 	p.mu.Unlock()
-	old.stop("scratchpad reset")
+	old.stop(old.cause)
 }
 
 // Close stops the runtime. Later Runs fail.
@@ -349,8 +374,9 @@ func (p *Pad) Close() {
 	p.open = false
 	clear(p.jobs)
 	old := p.rt
+	old.cause = causeClose
 	p.mu.Unlock()
-	old.stop("scratchpad closed")
+	old.stop(old.cause)
 }
 
 // timeoutReset resets the pad if rt is still current, telling the owners of
@@ -375,7 +401,7 @@ func (p *Pad) resetDelivering(rt *runtime, cause, except string) {
 			dropped = append(dropped, id)
 		}
 	}
-	old := p.swapLocked()
+	old := p.swapLocked(cause)
 	p.mu.Unlock()
 	old.stop(cause)
 	if p.opts.OnJobDone == nil {
@@ -387,7 +413,16 @@ func (p *Pad) resetDelivering(rt *runtime, cause, except string) {
 	}
 }
 
-const errReset = "the scratchpad was reset while this script was running; all variables were lost"
+// resetError is the result of a script whose runtime was stopped under it.
+// When the user did it, it says so, so the model doesn't redo what they
+// ended.
+func resetError(rt *runtime) Result {
+	did := map[string]string{causeReset: "reset the scratchpad", causeStop: "stopped you"}[rt.cause]
+	if did == "" {
+		return Result{Error: "the scratchpad was reset while this script was running; all variables were lost"}
+	}
+	return Result{Error: "the user " + did + " while this script was running, cancelling it and anything it was waiting for (approvals, secret requests); all variables were lost. Don't redo it unless they ask"}
+}
 
 func (p *Pad) timeoutResult() Result {
 	return Result{Error: fmt.Sprintf("script timed out after %s; the scratchpad was reset and all variables were lost", p.opts.Timeout)}
@@ -501,7 +536,7 @@ func (p *Pad) runOn(ctx context.Context, rt *runtime, src string) (Result, bool,
 		p.timeoutReset(rt, fmt.Sprintf("a script that ran longer than %s", p.opts.Timeout))
 		r = p.timeoutResult()
 	case <-rt.dead:
-		r = Result{Error: errReset}
+		r = resetError(rt)
 	case <-ctx.Done():
 		go p.watch(rt, done, deadline)
 		return Result{}, true, ctx.Err()
@@ -541,7 +576,7 @@ func (p *Pad) background(rt *runtime, s *script, done <-chan Result, deadline *t
 	if !p.open || p.rt != rt {
 		p.mu.Unlock()
 		deadline.Stop()
-		return Result{Error: errReset}
+		return resetError(rt)
 	}
 	p.nextJob++
 	id := fmt.Sprintf("j%d", p.nextJob)
@@ -558,7 +593,7 @@ func (p *Pad) background(rt *runtime, s *script, done <-chan Result, deadline *t
 			timedOut = true
 			r = p.timeoutResult()
 		case <-rt.dead:
-			r = Result{Error: errReset}
+			r = resetError(rt)
 		}
 
 		p.deliverMu.Lock()
@@ -643,7 +678,7 @@ func (p *Pad) toolsObject(rt *runtime) *goja.Object {
 			}
 			p.observe(CallEvent{Name: name, Args: args})
 			go func() {
-				out, err := p.reg.Call(rt.ctx, name, args)
+				out, err := p.call(rt.ctx, t, args)
 				// Non-string results cross into JS as JSON, so scripts see
 				// plain objects keyed by the json tags.
 				text, isString := out.(string)
@@ -653,6 +688,16 @@ func (p *Pad) toolsObject(rt *runtime) *goja.Object {
 						err = fmt.Errorf("result not JSON-serializable: %w", err)
 					}
 					text = string(b)
+				}
+				if p.opts.Secrets != nil {
+					if isString {
+						text = p.opts.Secrets.Redact(text)
+					} else {
+						text = p.opts.Secrets.RedactJSON(text)
+					}
+					if err != nil {
+						err = errors.New(p.opts.Secrets.Redact(err.Error()))
+					}
 				}
 				p.observe(CallEvent{Name: name, Args: args, Done: true, Result: text, Err: err})
 				p.onLoop(rt, func(vm *goja.Runtime) {
@@ -712,6 +757,47 @@ func (p *Pad) toolsObject(rt *runtime) *goja.Object {
 		return vm.ToValue("Documentation requested: it comes back under [documentation] with this script's result.")
 	})
 	return root
+}
+
+// call runs t. If t accepts secrets and args name any, the user approves
+// the call, shown with placeholders, before it runs with the values.
+func (p *Pad) call(ctx context.Context, t tool.Tool, args json.RawMessage) (any, error) {
+	if p.opts.Secrets != nil && t.AcceptsSecrets {
+		filled, names, err := p.opts.Secrets.Fill(args)
+		if err != nil {
+			return nil, err
+		}
+		if len(names) > 0 {
+			reason := "uses the secret " + names[0]
+			if len(names) > 1 {
+				reason = "uses the secrets " + strings.Join(names, ", ")
+			}
+			if err := tool.Approve(ctx, tool.Approval{Tool: t.Name, Action: callAction(args), Reasons: []string{reason}}); err != nil {
+				return nil, err
+			}
+			// The user saw the whole call; the tool mustn't ask again.
+			ctx, args = tool.WithApproved(ctx), filled
+		}
+	}
+	return p.reg.Call(ctx, t.Name, args)
+}
+
+// callAction shows a call's arguments to the user: the string itself when
+// there's a single string argument, like shell.bash's cmd, else JSON.
+func callAction(args json.RawMessage) string {
+	var m map[string]any
+	if json.Unmarshal(args, &m) == nil && len(m) == 1 {
+		for _, v := range m {
+			if s, ok := v.(string); ok {
+				return s
+			}
+		}
+	}
+	var b bytes.Buffer
+	if json.Indent(&b, args, "", "  ") != nil {
+		return string(args)
+	}
+	return b.String()
 }
 
 func (p *Pad) observe(e CallEvent) {

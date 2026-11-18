@@ -21,6 +21,7 @@ import (
 	"github.com/spiiritual/steel/internal/memory"
 	"github.com/spiiritual/steel/internal/schedule"
 	"github.com/spiiritual/steel/internal/scratchpad"
+	"github.com/spiiritual/steel/internal/secret"
 	"github.com/spiiritual/steel/internal/tool"
 	"github.com/spiiritual/steel/internal/usage"
 )
@@ -91,7 +92,7 @@ func run() error {
 	runCtx, stopRun := signal.NotifyContext(ctx, syscall.SIGTERM)
 	defer stopRun()
 
-	servers, warnings := mcp.Connect(runCtx, mcpServers, env.lookup) // either signal interrupts a slow server
+	servers, warnings := mcp.Connect(runCtx, mcpServers, env.expand) // either signal interrupts a slow server
 	defer servers.Close()
 	for _, w := range warnings {
 		fmt.Fprintln(os.Stderr, "steel:", w)
@@ -113,8 +114,21 @@ func run() error {
 	check := func(cmd string) []string {
 		return bashcheck.Check(cmd, bashcheck.Options{Dir: cwd, Home: home, Protected: protected})
 	}
+	// The model uses the user's secrets; steel's own tokens, wherever they
+	// come from, are only redacted from tool results.
+	tokens := map[string]string{}
+	for _, sc := range secrets {
+		v, _ := env.lookup(sc.env)
+		tokens[sc.env] = strings.TrimSpace(v)
+	}
+	store, err := secret.Open(secretsPath(*o.configPath), secret.Options{Redact: tokens})
+	if err != nil {
+		return err
+	}
+	bot.SetSecrets(store)
 	builtin := []tool.Tool{tool.Bash(cwd, check)}
-	system := *o.system
+	builtin = append(builtin, secret.Tools(store)...)
+	system := systemPrompt(*o.system)
 	var mem memory.Memory
 	if *o.memoryDir != "" {
 		opened, err := openMemory(o, usageLog.Track(logCalls(provider, "compaction", os.Stderr), "compaction"))
@@ -159,7 +173,7 @@ func run() error {
 		Model:       *o.model,
 		System:      system,
 		Memory:      mem,
-		NewToolbox:  func(h agent.Hooks) agent.Toolbox { return newPad(tools, guidance, *o.toolBudget, h) },
+		NewToolbox:  func(h agent.Hooks) agent.Toolbox { return newPad(tools, guidance, store, *o.toolBudget, h) },
 		Dir:         *o.dataDir,
 		IdleTimeout: *o.idle,
 	}, func(id string, e agent.Event) {
@@ -229,7 +243,7 @@ func namespace(name string) string {
 
 // newPad builds a session's scratchpad, routing its nested tool calls and
 // finished background jobs back into the session.
-func newPad(tools *tool.Registry, guidance map[string]string, toolBudget int, h agent.Hooks) *scratchpad.Pad {
+func newPad(tools *tool.Registry, guidance map[string]string, secrets *secret.Store, toolBudget int, h agent.Hooks) *scratchpad.Pad {
 	declBudget := toolBudget * 4 // ~4 bytes per token
 	switch {
 	case toolBudget < 0:
@@ -243,7 +257,9 @@ func newPad(tools *tool.Registry, guidance map[string]string, toolBudget int, h 
 		Approver: func(ctx context.Context, a tool.Approval) (bool, error) {
 			return h.Approve(ctx, a.Tool, a.Action, a.Reasons)
 		},
-		Caller: h.Session,
+		Caller:      h.Session,
+		Secrets:     secrets,
+		SecretAsker: h.AskSecret,
 		OnCall: func(e scratchpad.CallEvent) {
 			if !e.Done {
 				h.Emit(agent.ToolStart{Name: e.Name, Args: e.Args, Nested: true})

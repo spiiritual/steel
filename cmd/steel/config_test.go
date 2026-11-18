@@ -38,28 +38,32 @@ func TestSettingPrecedence(t *testing.T) {
 	}
 }
 
-// Secrets with awkward characters survive a save, and editing one keeps the
-// rest of the file.
-func TestDotenvRoundTrip(t *testing.T) {
-	path := filepath.Join(t.TempDir(), ".env")
-	os.WriteFile(path, []byte("# keys\nexport A='single'\nB=old\n"), 0o600)
-	d, err := readDotenv(path)
+// The user's secrets live in secrets.env, apart from steel's own variables
+// in .env; ones older versions kept in .env move there. mcpServers can
+// expand them, but steel's own lookups never see them.
+func TestUserSecretsMoveToSecretsEnv(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.json")
+	os.WriteFile(filepath.Join(dir, ".env"), []byte("OPENAI_API_KEY=sk-1\nOPENAI_MODEL=m\nGH_TOKEN=ghp_1\n"), 0o600)
+	os.WriteFile(filepath.Join(dir, "secrets.env"), []byte("PIN=12\n"), 0o600)
+
+	env, err := loadEnvironment(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	d.set("B", `p@ss "w#rd" \x`)
-	d.set("C", "plain")
-	if err := d.write(path); err != nil {
-		t.Fatal(err)
+	if b, _ := os.ReadFile(filepath.Join(dir, ".env")); string(b) != "OPENAI_API_KEY=sk-1\nOPENAI_MODEL=m\n" {
+		t.Errorf(".env:\n%s", b)
 	}
-	if d, err = readDotenv(path); err != nil {
-		t.Fatal(err)
+	if b, _ := os.ReadFile(filepath.Join(dir, "secrets.env")); string(b) != "PIN=12\nGH_TOKEN=ghp_1\n" {
+		t.Errorf("secrets.env:\n%s", b)
 	}
-	got := d.vars()
-	if got["A"] != "single" || got["B"] != `p@ss "w#rd" \x` || got["C"] != "plain" || len(got) != 3 {
-		t.Errorf("vars = %q", got)
+	if v, ok := env.expand("GH_TOKEN"); !ok || v != "ghp_1" {
+		t.Errorf("expand GH_TOKEN = %q, %v", v, ok)
 	}
-	if d.lines[0] != "# keys" {
-		t.Errorf("comment lost: %q", d.lines)
+	if _, ok := env.lookup("GH_TOKEN"); ok {
+		t.Error("steel's own lookup sees a user secret")
+	}
+	if secretPath(path, "GH_TOKEN") != filepath.Join(dir, "secrets.env") || secretPath(path, "TELEGRAM_BOT_TOKEN") != filepath.Join(dir, ".env") {
+		t.Error("config set saves to the wrong file")
 	}
 }

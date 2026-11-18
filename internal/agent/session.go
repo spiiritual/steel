@@ -56,6 +56,8 @@ type Session struct {
 	// approvals are the requests waiting for the user, by ID; each channel
 	// takes one answer.
 	approvals map[string]chan bool
+	// secret is the secret request waiting for the user, if any.
+	secret *secretWait
 	// reading are the callers waiting for the running turn, which read
 	// their input; reply is its last reply so far.
 	reading []chan<- TurnResult
@@ -105,7 +107,7 @@ func waiters(qs []queued) []chan<- TurnResult {
 // question for the user or background jobs. Callers hold s.mu.
 func (s *Session) busyLocked() bool {
 	// Busy is safe under s.mu (see the lock order).
-	return s.running || len(s.inbox) > 0 || len(s.approvals) > 0 || (s.box != nil && s.box.Busy())
+	return s.running || len(s.inbox) > 0 || len(s.approvals) > 0 || s.secret != nil || (s.box != nil && s.box.Busy())
 }
 
 func newSession(id string, cfg *Config, emit func(Event)) *Session {
@@ -222,9 +224,7 @@ func (s *Session) start(text string, notes []string) (<-chan TurnResult, error) 
 // approve asks the user to approve a tool's action and waits for the
 // answer or for ctx to end.
 func (s *Session) approve(ctx context.Context, tool, action string, reasons []string) (bool, error) {
-	var b [8]byte
-	rand.Read(b[:])
-	id := hex.EncodeToString(b[:])
+	id := newRequestID()
 	answer := make(chan bool, 1)
 	s.mu.Lock()
 	if s.approvals == nil {
@@ -257,6 +257,14 @@ func (s *Session) approve(ctx context.Context, tool, action string, reasons []st
 	}
 }
 
+// newRequestID returns a random ID for an approval or secret request, so
+// a stale button press can't answer a newer request.
+func newRequestID() string {
+	var b [8]byte
+	rand.Read(b[:])
+	return hex.EncodeToString(b[:])
+}
+
 // answer passes the user's answer to approval request id, reporting
 // whether it was still waiting.
 func (s *Session) answer(id string, allow bool) bool {
@@ -268,6 +276,74 @@ func (s *Session) answer(id string, allow bool) bool {
 		ch <- allow
 	}
 	return ok
+}
+
+// secretWait is a SecretRequest waiting for the user.
+type secretWait struct {
+	id     string
+	answer chan secretAnswer // takes one answer
+}
+
+type secretAnswer struct {
+	value string
+	ok    bool // false: the user declined
+}
+
+// askSecret asks the user to enter secret name and waits for the value,
+// the user declining, or ctx ending. The value goes to save before the
+// user is told it was saved.
+func (s *Session) askSecret(ctx context.Context, name, purpose string, save func(string) error) error {
+	w := &secretWait{id: newRequestID(), answer: make(chan secretAnswer, 1)}
+	s.mu.Lock()
+	if s.secret != nil {
+		s.mu.Unlock()
+		return errors.New("the user is already being asked for a secret here; wait for that to finish, then ask for the next")
+	}
+	s.secret = w
+	s.mu.Unlock()
+	defer func() {
+		s.mu.Lock()
+		if s.secret == w {
+			s.secret = nil
+		}
+		s.mu.Unlock()
+	}()
+
+	s.emit(SecretRequest{ID: w.id, Name: name, Purpose: purpose})
+	select {
+	case a := <-w.answer:
+		if !a.ok {
+			s.emit(SecretDone{ID: w.id, Outcome: SecretDeclined})
+			return fmt.Errorf("the user declined to enter %s. Don't ask again unless they say so", name)
+		}
+		if err := save(a.value); err != nil {
+			s.emit(SecretDone{ID: w.id, Outcome: SecretNotSaved, Problem: err.Error()})
+			return fmt.Errorf("the value the user entered for %s wasn't saved: %w", name, err)
+		}
+		s.emit(SecretDone{ID: w.id, Outcome: SecretReceived})
+		return nil
+	case <-ctx.Done():
+		outcome := SecretCancelled
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			outcome = SecretExpired
+		}
+		s.emit(SecretDone{ID: w.id, Outcome: outcome})
+		return ctx.Err()
+	}
+}
+
+// answerSecret passes the user's answer to secret request id, reporting
+// whether it was still waiting.
+func (s *Session) answerSecret(id string, a secretAnswer) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	w := s.secret
+	if w == nil || w.id != id {
+		return false
+	}
+	s.secret = nil
+	w.answer <- a
+	return true
 }
 
 // deliver queues text from a toolbox (e.g. a finished job) for the model.
@@ -458,7 +534,7 @@ func (s *Session) toolbox() Toolbox {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.box == nil && s.cfg.NewToolbox != nil && !s.closed {
-		s.box = s.cfg.NewToolbox(Hooks{Session: s.id, Emit: s.emit, Deliver: s.deliver, Approve: s.approve})
+		s.box = s.cfg.NewToolbox(Hooks{Session: s.id, Emit: s.emit, Deliver: s.deliver, Approve: s.approve, AskSecret: s.askSecret})
 		if s.evicted {
 			s.evicted = false
 			s.notes = append(s.notes, llm.Message{Role: llm.RoleUser, Content: scratchpadClosed})

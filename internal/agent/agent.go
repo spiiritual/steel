@@ -73,6 +73,35 @@ const (
 	Cancelled ApprovalOutcome = "cancelled" // the work asking was stopped
 )
 
+// SecretRequest asks the user to enter a secret's value where the model
+// can't see it. Channels pass the value to Sessions.ProvideSecret, or
+// Sessions.CancelSecret if the user declines, without it ever becoming a
+// message; a SecretDone with the same ID follows however it ends. A
+// session has at most one waiting at a time.
+type SecretRequest struct {
+	ID      string // random, like ApprovalRequest.ID
+	Name    string
+	Purpose string // what the model says it's for
+}
+
+// SecretDone reports how a SecretRequest ended.
+type SecretDone struct {
+	ID      string
+	Outcome SecretOutcome
+	Problem string // why it wasn't saved, for SecretNotSaved
+}
+
+// SecretOutcome is how a SecretRequest ended.
+type SecretOutcome string
+
+const (
+	SecretReceived  SecretOutcome = "received"  // and saved
+	SecretNotSaved  SecretOutcome = "not saved" // received, but saving failed
+	SecretDeclined  SecretOutcome = "declined"  // the user cancelled
+	SecretExpired   SecretOutcome = "expired"   // nobody answered in time
+	SecretCancelled SecretOutcome = "cancelled" // the work asking was stopped
+)
+
 func (TextDelta) event() {}
 func (Reply) event()     {}
 func (ToolStart) event() {}
@@ -82,6 +111,8 @@ func (Notice) event()    {}
 
 func (ApprovalRequest) event() {}
 func (ApprovalDone) event()    {}
+func (SecretRequest) event()   {}
+func (SecretDone) event()      {}
 
 // Toolbox is what a session gives the model; in steel, a scratchpad.
 type Toolbox interface {
@@ -108,6 +139,10 @@ type Hooks struct {
 	// Approve asks the user whether a tool may do something and waits for
 	// the answer, until ctx ends. Safe for concurrent use.
 	Approve func(ctx context.Context, tool, action string, reasons []string) (bool, error)
+	// AskSecret asks the user to enter secret name's value out of the
+	// model's sight, waits for it until ctx ends, and passes it to save
+	// before telling the user how it went. Safe for concurrent use.
+	AskSecret func(ctx context.Context, name, purpose string, save func(value string) error) error
 }
 
 // Config describes how sessions are built.

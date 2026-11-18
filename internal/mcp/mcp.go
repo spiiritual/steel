@@ -207,9 +207,10 @@ func adapt(session *sdk.ClientSession, name string, t *sdk.Tool) tool.Tool {
 	inputValidator := compileSchema(t.InputSchema)
 	signature := tool.SchemaSignature(t.InputSchema, t.OutputSchema, "string")
 	return tool.Tool{
-		Name:        name,
-		Description: cmp.Or(t.Description, t.Title),
-		Signature:   signature,
+		Name:           name,
+		Description:    cmp.Or(t.Description, t.Title),
+		Signature:      signature,
+		AcceptsSecrets: true,
 		Run: func(ctx context.Context, raw json.RawMessage) (any, error) {
 			var args map[string]any
 			if err := json.Unmarshal(raw, &args); err != nil {

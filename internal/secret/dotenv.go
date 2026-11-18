@@ -1,4 +1,4 @@
-package main
+package secret
 
 import (
 	"errors"
@@ -13,27 +13,30 @@ import (
 	"github.com/spiiritual/steel/internal/datafile"
 )
 
-// dotenv is the .env file next to config.json that holds secrets: KEY=value
+// Dotenv is the .env file next to config.json that holds secrets: KEY=value
 // lines, with optional "export ", quotes and # comments. steel looks its
 // values up itself and never exports them to its own environment, so tools
 // (shell.bash) can't read them.
-type dotenv struct {
+type Dotenv struct {
 	lines []string // kept verbatim, so comments and order survive edits
 }
 
 // envName is what a .env key (and so a secret's name) must look like.
 var envName = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
 
-// readDotenv reads path; a missing file is an empty one.
-func readDotenv(path string) (*dotenv, error) {
+// isVar reports whether s can be a .env key.
+func isVar(s string) bool { return envName.MatchString(s) }
+
+// ReadDotenv reads path; a missing file is an empty one.
+func ReadDotenv(path string) (*Dotenv, error) {
 	b, err := os.ReadFile(path)
 	if errors.Is(err, fs.ErrNotExist) {
-		return &dotenv{}, nil
+		return &Dotenv{}, nil
 	}
 	if err != nil {
 		return nil, err
 	}
-	d := &dotenv{lines: strings.Split(strings.TrimRight(string(b), "\n"), "\n")}
+	d := &Dotenv{lines: strings.Split(strings.TrimRight(string(b), "\n"), "\n")}
 	for i, line := range d.lines {
 		if _, _, ok, err := parseDotenvLine(line); ok && err != nil {
 			return nil, fmt.Errorf("%s:%d: %w", path, i+1, err)
@@ -64,8 +67,8 @@ func parseDotenvLine(line string) (key, value string, ok bool, err error) {
 	return key, value, true, err
 }
 
-// vars returns the variables the file sets; a later line wins.
-func (d *dotenv) vars() map[string]string {
+// Vars returns the variables the file sets; a later line wins.
+func (d *Dotenv) Vars() map[string]string {
 	m := map[string]string{}
 	for _, line := range d.lines {
 		if k, v, ok, err := parseDotenvLine(line); ok && err == nil {
@@ -75,16 +78,16 @@ func (d *dotenv) vars() map[string]string {
 	return m
 }
 
-// set replaces key's first line, dropping any later ones, or appends one.
-func (d *dotenv) set(key, value string) {
+// Set replaces key's first line, dropping any later ones, or appends one.
+func (d *Dotenv) Set(key, value string) {
 	line := key + "=" + value
-	if strings.ContainsAny(value, " \t#\"'\\") || value == "" {
+	if strings.ContainsAny(value, " \t\r\n#\"'\\") || value == "" {
 		line = key + "=" + strconv.Quote(value)
 	}
 	for i, old := range d.lines {
 		if k, _, ok, _ := parseDotenvLine(old); ok && k == key {
 			// No line before i sets key, so i is still its place after unset.
-			d.unset(key)
+			d.Unset(key)
 			d.lines = slices.Insert(d.lines, i, line)
 			return
 		}
@@ -92,8 +95,8 @@ func (d *dotenv) set(key, value string) {
 	d.lines = append(d.lines, line)
 }
 
-// unset removes every line setting key, reporting whether there was one.
-func (d *dotenv) unset(key string) bool {
+// Unset removes every line setting key, reporting whether there was one.
+func (d *Dotenv) Unset(key string) bool {
 	kept := d.lines[:0]
 	for _, line := range d.lines {
 		if k, _, ok, _ := parseDotenvLine(line); ok && k == key {
@@ -106,6 +109,7 @@ func (d *dotenv) unset(key string) bool {
 	return removed
 }
 
-func (d *dotenv) write(path string) error {
+// Write saves the file at path, readable only by its owner.
+func (d *Dotenv) Write(path string) error {
 	return datafile.WriteFile(path, []byte(strings.Join(d.lines, "\n")+"\n"))
 }

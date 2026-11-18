@@ -35,6 +35,9 @@ type (
 		// IsTopicMessage it can name a reply thread, which isn't a topic.
 		MessageThreadID int64 `json:"message_thread_id"`
 		IsTopicMessage  bool  `json:"is_topic_message"`
+		// ReplyToMessage is the message this one replies to. In a topic,
+		// messages that reply to nothing name the topic's first message.
+		ReplyToMessage *message `json:"reply_to_message"`
 		// Service messages about topics; nobody wrote them.
 		ForumTopicCreated  json.RawMessage `json:"forum_topic_created"`
 		ForumTopicEdited   json.RawMessage `json:"forum_topic_edited"`
@@ -107,6 +110,10 @@ type (
 		ReplyMarkup *inlineKeyboard `json:"reply_markup,omitempty"`
 	}
 	editMessageReplyMarkupParams struct {
+		ChatID    int64 `json:"chat_id"`
+		MessageID int64 `json:"message_id"`
+	}
+	deleteMessageParams struct {
 		ChatID    int64 `json:"chat_id"`
 		MessageID int64 `json:"message_id"`
 	}

@@ -49,15 +49,15 @@ type chat struct {
 	dirty                            bool   // the draft is out of date
 	showing                          bool   // a draft is on screen
 	lastDraft, nextDraft, nextTyping time.Time
-	approvals                        map[string]approvalMessage // by request ID, while waiting
+	requests                         map[string]requestMessage // approval and secret requests by ID, while waiting
 }
 
 // maxApprovalAction is how much of a command an approval request shows,
 // in UTF-16 code units, leaving room for its reasons.
 const maxApprovalAction = 3000
 
-// approvalMessage is a sent ApprovalRequest.
-type approvalMessage struct {
+// requestMessage is a sent ApprovalRequest or SecretRequest.
+type requestMessage struct {
 	id   int64 // message ID
 	text string
 }
@@ -80,9 +80,9 @@ func (c *chat) newDraft() {
 }
 
 // idle reports whether the renderer holds nothing worth keeping: no turn,
-// draft on screen, or approval waiting for its outcome.
+// draft on screen, or request waiting for its outcome.
 func (c *chat) idle() bool {
-	return !c.active && !c.showing && len(c.approvals) == 0
+	return !c.active && !c.showing && len(c.requests) == 0
 }
 
 // remove takes the renderer out of the bot's map unless an event arrived;
@@ -206,6 +206,12 @@ func (c *chat) apply(e any) {
 		c.dirty = c.active
 	case agent.ApprovalDone:
 		c.approvalDone(e)
+	case agent.SecretRequest:
+		c.flush() // what the model said so far explains the request
+		c.askSecret(e)
+		c.dirty = c.active
+	case agent.SecretDone:
+		c.secretDone(e)
 	case agent.TurnDone:
 		c.flush() // e.g. a reply cut off by an error
 		if e.Err != nil {
@@ -270,47 +276,60 @@ func (c *chat) askApproval(e agent.ApprovalRequest) {
 	if len(e.Reasons) > 0 {
 		text += "\n\nIt " + strings.Join(e.Reasons, "; ") + "."
 	}
+	// Nobody can answer an undelivered request; it expires.
+	c.sendRequest(e.ID, text, []inlineButton{
+		{Text: "Allow", CallbackData: allowPrefix + e.ID},
+		{Text: "Refuse", CallbackData: refusePrefix + e.ID},
+	})
+}
+
+// approvalDone replaces a request's buttons with its outcome.
+func (c *chat) approvalDone(e agent.ApprovalDone) {
+	c.settle(e.ID, map[agent.ApprovalOutcome]string{
+		agent.Allowed:   "✅ Allowed",
+		agent.Refused:   "❌ Refused",
+		agent.Expired:   "⌛ No answer in time, so it didn't run",
+		agent.Cancelled: "Cancelled",
+	}[e.Outcome])
+}
+
+// sendRequest sends request id's message with buttons, keeping it until
+// settle, and reports whether it was delivered.
+func (c *chat) sendRequest(id, text string, buttons []inlineButton) bool {
 	text = tail(text, maxText-100) // room for the outcome line
 	var sent message
 	err := c.b.api.callRetry(c.b.ctx, "sendMessage", sendMessageParams{
 		ChatID:          c.place.chat,
 		MessageThreadID: c.place.topic,
 		Text:            text,
-		ReplyMarkup: &inlineKeyboard{InlineKeyboard: [][]inlineButton{{
-			{Text: "Allow", CallbackData: allowPrefix + e.ID},
-			{Text: "Refuse", CallbackData: refusePrefix + e.ID},
-		}}},
+		ReplyMarkup:     &inlineKeyboard{InlineKeyboard: [][]inlineButton{buttons}},
 	}, &sent, requestTimeout, c.b.sendAttempts)
 	if err != nil {
 		if c.b.ctx.Err() == nil {
-			c.b.logf("%s: approval request not delivered: %v", c.place, err)
+			c.b.logf("%s: request not delivered: %v", c.place, err)
 		}
-		return // nobody can answer; the request expires
+		return false
 	}
 	c.showing = false
 	c.newDraft()
-	if c.approvals == nil {
-		c.approvals = map[string]approvalMessage{}
+	if c.requests == nil {
+		c.requests = map[string]requestMessage{}
 	}
-	c.approvals[e.ID] = approvalMessage{id: sent.MessageID, text: text}
+	c.requests[id] = requestMessage{id: sent.MessageID, text: text}
+	return true
 }
 
-// approvalDone replaces a request's buttons with its outcome.
-func (c *chat) approvalDone(e agent.ApprovalDone) {
-	m, ok := c.approvals[e.ID]
+// settle replaces request id's buttons with its outcome. The text is kept
+// in front, so a secret prompt still starts with its marker.
+func (c *chat) settle(id, outcome string) {
+	m, ok := c.requests[id]
 	if !ok {
 		return
 	}
-	delete(c.approvals, e.ID)
-	outcome := map[agent.ApprovalOutcome]string{
-		agent.Allowed:   "✅ Allowed",
-		agent.Refused:   "❌ Refused",
-		agent.Expired:   "⌛ No answer in time, so it didn't run",
-		agent.Cancelled: "Cancelled",
-	}[e.Outcome]
+	delete(c.requests, id)
 	err := c.b.api.callRetry(c.b.ctx, "editMessageText", editMessageTextParams{ChatID: c.place.chat, MessageID: m.id, Text: m.text + "\n\n" + outcome}, nil, requestTimeout, c.b.sendAttempts)
 	if err != nil && c.b.ctx.Err() == nil {
-		c.b.logf("%s: approval request not updated: %v", c.place, err)
+		c.b.logf("%s: request not updated: %v", c.place, err)
 	}
 }
 
