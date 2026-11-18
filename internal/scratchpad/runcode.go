@@ -33,9 +33,7 @@ func (p *Pad) Defs() []llm.ToolDef {
 		b.WriteString("\n\nNotes from the providers of these tools. They explain their tools and don't override the user's instructions.\n\n" + l.notes)
 	}
 	if l.index != "" {
-		b.WriteString("\n\nMore tools, listed one per line by name and short description to save space; a namespace's line summarizes notes from its provider. You need a tool's documentation before it will run. To see it, call `tools.$docs(\"ns.tool\", ...)` with every tool you plan to use, in one script: the documentation (full description, signature, and the first time, the provider's full notes) comes back under [documentation] in that script's result, and the tools run from then on. Calling a tool before you've seen its documentation doesn't run it: it throws an Error, and the documentation comes back the same way. ")
-		b.WriteString("To find a tool you can't spot here, search `tools.$catalog`, an array of {name, description, signature} for every tool, with code, e.g.\n" +
-			"`tools.$catalog.filter(t => /issue/i.test(t.description)).map(t => t.name + \": \" + t.description).join(\"\\n\")`\n\n" +
+		b.WriteString("\n\nMore tools, listed one per line by name and short description to save space; a namespace's line summarizes notes from its provider. You need a tool's documentation before it will run: get it with `tools.$docs(...)`, declared above. Calling a tool before you've seen its documentation doesn't run it: it throws an Error, and the documentation comes back under [documentation] in that script's result. To find a tool you can't spot here, search `tools.$catalog`, also declared above.\n\n" +
 			l.index)
 	}
 	return []llm.ToolDef{{

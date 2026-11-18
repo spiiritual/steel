@@ -331,7 +331,7 @@ func TestCatalogAndIndexedDescription(t *testing.T) {
 	defer p.Close()
 
 	desc := p.Defs()[0].Description
-	if !strings.Contains(desc, "tools.t:\n  echo\n  fail\n  sleep\n  stat") || !strings.Contains(desc, "tools.$catalog") {
+	if !strings.Contains(desc, "tools.t:\n  t.echo\n  t.fail\n  t.sleep\n  t.stat") || !strings.Contains(desc, "tools.$catalog") {
 		t.Errorf("description lacks index or catalog hint:\n%s", desc)
 	}
 	if r := run(t, p, `tools.$catalog.filter(t => /echo|stat/.test(t.name)).map(t => t.name).join(",")`); r.Value != "t.echo,t.stat" {
@@ -401,6 +401,40 @@ func TestIndexedToolsDiscloseBeforeRunning(t *testing.T) {
 	p.Reset()
 	if r := run(t, p, `await tools.t.wipe({id: "a"})`); r.Value != "wiped" || r.Docs != "" {
 		t.Fatalf("documented call = %+v", r)
+	}
+}
+
+func TestOneRefusalDocumentsEveryToolTheScriptMentions(t *testing.T) {
+	ok := func(context.Context, json.RawMessage) (any, error) { return "ok", nil }
+	p := New(tool.NewRegistry(
+		tool.Tool{Name: "b.wait", Description: "Wait docs.", Run: ok},
+		tool.Tool{Name: "b.title", Description: "Title docs.", Run: ok},
+		tool.Tool{Name: "b.snap", Description: "Snap docs.", Run: ok},
+		tool.Tool{Name: "b.unused", Description: "Unused docs.", Run: ok},
+	), Options{DeclBudget: 1})
+	defer p.Close()
+	// The script stops at its first call, but the refusal documents the
+	// tools it would have called next too, however it spells them, so the
+	// rerun runs instead of being refused once per tool.
+	script := `await tools.b.wait(); const b = tools["b"]; await b.title(); await b.snap(); return "done"`
+	r := run(t, p, script)
+	if !strings.Contains(r.Error, "b.wait did not run") {
+		t.Fatalf("first run = %+v", r)
+	}
+	for _, d := range []string{"Wait docs.", "Title docs.", "Snap docs."} {
+		if !strings.Contains(r.Docs, d) {
+			t.Errorf("docs lack %q:\n%s", d, r.Docs)
+		}
+	}
+	if strings.Contains(r.Docs, "Unused docs.") {
+		t.Errorf("docs include a tool the script doesn't mention:\n%s", r.Docs)
+	}
+	if r := run(t, p, script); r.Value != "done" {
+		t.Errorf("rerun = %+v", r)
+	}
+	// A script that's refused nothing documents nothing, even tools it names.
+	if r := run(t, p, `"b.unused"`); r.Docs != "" {
+		t.Errorf("unrefused script documented %q", r.Docs)
 	}
 }
 

@@ -44,25 +44,32 @@ func TestLayoutOverBudgetIndexesCompactly(t *testing.T) {
 		{Name: "github.list_issues", Signature: "(): Promise<string>"},
 		{Name: "tiny.ping", Signature: "(): Promise<string>"},
 	}
-	// Room for fs and tiny, not github: namespaces fill in order, and a later
-	// small one still gets full declarations after a big one is indexed.
+	// Room for fs and tiny, not github: tools fill in order, and a later
+	// small one still gets its full declaration after a big one is indexed.
 	budget := len(render(tools[:1])) + len(render(tools[3:])) + 1
 	l := newLayout(tools, budget, nil, map[string]string{
 		"fs":     "Paths are relative.",
 		"github": "Use the GitHub tools for repos. Search before creating issues.",
 	})
-	if !strings.Contains(l.decl, "read_file(") || !strings.Contains(l.decl, "ping(") || strings.Contains(l.decl, "github") {
+	if !strings.Contains(l.decl, "read_file(") || !strings.Contains(l.decl, "ping(") || strings.Contains(l.decl, "github: {") {
 		t.Errorf("declared:\n%s", l.decl)
+	}
+	// With an index, the tools for using it are declared first, and the
+	// $docs example names a real indexed tool, not a placeholder.
+	if !strings.HasPrefix(l.decl, "declare const tools: {\n  /**") || !strings.Contains(l.decl, "$catalog: {") ||
+		!strings.Contains(l.decl, `tools.$docs("github.create_issue")`) || strings.Index(l.decl, "$docs(...names") > strings.Index(l.decl, "fs: {") {
+		t.Errorf("index tools not declared first:\n%s", l.decl)
 	}
 	// Fully declared namespaces get their guidance upfront, quoted.
 	if l.notes != "tools.fs.*:\n> Paths are relative.\n\n" {
 		t.Errorf("notes = %q", l.notes)
 	}
-	// Indexed namespaces get a one-line guidance summary; indexed tools a
-	// name and short description. The rest waits for the first call.
+	// Indexed namespaces get a one-line guidance summary; indexed tools
+	// their full name, as tools.$docs takes it, and a short description.
+	// The rest waits for the first call.
 	want := "tools.github: Use the GitHub tools for repos\n" +
-		"  create_issue — " + strings.TrimSpace(strings.Repeat("long ", 16)) + "…\n" +
-		"  list_issues\n"
+		"  github.create_issue — " + strings.TrimSpace(strings.Repeat("long ", 16)) + "…\n" +
+		"  github.list_issues\n"
 	if l.index != want {
 		t.Errorf("index = %q\nwant    %q", l.index, want)
 	}
@@ -71,16 +78,29 @@ func TestLayoutOverBudgetIndexesCompactly(t *testing.T) {
 	}
 }
 
-func TestLayoutRecentlyUsedFirst(t *testing.T) {
+func TestLayoutDeclaresRecentlyUsedToolsOfABigNamespace(t *testing.T) {
 	tools := []tool.Tool{
 		{Name: "a.one", Signature: "(): Promise<string>"},
 		{Name: "b.one", Signature: "(): Promise<string>"},
 		{Name: "b.two", Signature: "(): Promise<string>"},
+		{Name: "b.three", Signature: "(): Promise<string>"},
 	}
-	// Room for one namespace: the recently used one gets it, and its tools
-	// are listed most recent first.
-	l := newLayout(tools, len(render(tools[1:]))+1, []string{"b.two", "b.one"}, nil)
-	if !strings.Contains(l.decl, "b: {\n    two(") || strings.Contains(l.decl, "a: {") || l.index != "tools.a:\n  one\n" {
-		t.Errorf("decl:\n%s\nindex: %q", l.decl, l.index)
+	// Room for two tools, not all of b: b's recently used tools get it, most
+	// recent first, rather than b being indexed whole for not fitting.
+	budget := len(render(tools[2:3])) + len(render(tools[3:4])) + 1
+	l := newLayout(tools, budget, []string{"b.three", "b.two"}, map[string]string{"b": "Use b carefully. Really."})
+	if !strings.Contains(l.decl, "b: {\n    three(): Promise<string>;\n    two(") || strings.Contains(l.decl, "one(") {
+		t.Errorf("decl:\n%s", l.decl)
+	}
+	// b's notes are shown in full with its declared tools, so its index
+	// heading doesn't summarize them and its first docs don't repeat them.
+	if l.notes != "tools.b.*:\n> Use b carefully. Really.\n\n" {
+		t.Errorf("notes = %q", l.notes)
+	}
+	if want := "tools.a:\n  a.one\ntools.b:\n  b.one\n"; l.index != want {
+		t.Errorf("index = %q\nwant    %q", l.index, want)
+	}
+	if _, ok := l.nsNotes["b"]; ok {
+		t.Errorf("nsNotes = %q", l.nsNotes)
 	}
 }

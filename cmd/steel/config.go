@@ -175,9 +175,10 @@ Example: steel config set idle 2h`,
 	{
 		flag: "tool-budget", path: []string{"toolBudget"},
 		summary: "approximate tokens of full tool declarations shown to the model",
-		details: `Tool namespaces that fit get their full declarations in the prompt; the
-rest get one line per tool, and the model reads their docs before first
-use. 0 indexes every namespace, a negative number shows everything in full.
+		details: `Tools that fit, most recently used first, get their full declarations
+in the prompt; the rest get one line each, and the model reads their docs
+before first use. 0 indexes every tool, a negative number shows everything
+in full.
 Example: steel config set tool-budget 8000`,
 	},
 	{

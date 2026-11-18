@@ -4,6 +4,7 @@ import (
 	"cmp"
 	"fmt"
 	"slices"
+	"strconv"
 	"strings"
 	"unicode/utf8"
 
@@ -23,10 +24,12 @@ type layout struct {
 	nsNotes map[string]string // namespace → quoted guidance
 }
 
-// newLayout orders tools by recent use, then declares top-level namespaces
-// in full while they fit within budget bytes (<= 0: unlimited). The rest go
-// in the index: per namespace, a one-line summary of its guidance, then one
-// line per tool with its name and short description.
+// newLayout orders tools by recent use, then declares them in full, one
+// tool at a time, while they fit within budget bytes (<= 0: unlimited), so
+// a big namespace still gets its most used tools declared. The rest go in
+// the index: per namespace, a one-line summary of its guidance unless it
+// was shown in full already, then one line per tool with its full name and
+// short description.
 //
 // recent lists tool names, most recently used first; tools not in it keep
 // registration order after those that are. guidance maps namespaces to
@@ -35,30 +38,35 @@ func newLayout(tools []tool.Tool, budget int, recent []string, guidance map[stri
 	full, indexed := partition(byRecency(tools, recent), budget)
 	l := layout{docs: map[string]string{}, nsNotes: map[string]string{}}
 
-	var fullTools []tool.Tool
+	// A namespace with any tool declared gets its guidance in full upfront.
 	var notes strings.Builder
-	for _, g := range full {
-		fullTools = append(fullTools, g.tools...)
-		if text := guidance[g.name]; text != "" && g.name != "" {
-			fmt.Fprintf(&notes, "tools.%s.*:\n%s\n", g.name, quote(text))
+	shown := map[string]bool{}
+	for _, t := range full {
+		ns := namespace(t.Name)
+		if text := guidance[ns]; text != "" && ns != "" && !shown[ns] {
+			fmt.Fprintf(&notes, "tools.%s.*:\n%s\n", ns, quote(text))
 		}
+		shown[ns] = true
 	}
-	l.decl, l.notes = render(fullTools), notes.String()
+	l.decl, l.notes = render(full), notes.String()
 
 	var idx strings.Builder
-	for _, g := range indexed {
+	for _, g := range byNamespace(indexed) {
 		if g.name == "" {
 			idx.WriteString("tools:\n")
 		} else {
 			idx.WriteString("tools." + g.name + ":")
-			if text := guidance[g.name]; text != "" {
+			if text := guidance[g.name]; text != "" && !shown[g.name] {
 				idx.WriteString(" " + shortDesc(text, 160))
 				l.nsNotes[g.name] = quote(text)
 			}
 			idx.WriteString("\n")
 		}
 		for _, t := range g.tools {
-			idx.WriteString("  " + tool.TSKey(strings.TrimPrefix(t.Name, g.name+".")))
+			// The full name, as tools.$docs takes it: a weak model copies
+			// what it sees, and a name relative to the heading above
+			// sent it to $docs("agent_browser_open"), which doesn't exist.
+			idx.WriteString("  " + t.Name)
 			if d := shortDesc(t.Description, 80); d != "" {
 				idx.WriteString(" — " + d)
 			}
@@ -67,7 +75,33 @@ func newLayout(tools []tool.Tool, budget int, recent []string, guidance map[stri
 		}
 	}
 	l.index = idx.String()
+	if l.index != "" {
+		// What the index needs to be used, declared first, where a model
+		// looks for what it can call: how to read an indexed tool's docs,
+		// and how to search for one it can't spot.
+		l.decl = strings.Replace(l.decl, "declare const tools: {\n", "declare const tools: {\n"+indexTools(indexed[0].Name), 1)
+	}
 	return l
+}
+
+// indexTools declares tools.$catalog and tools.$docs, which pad.go defines.
+// Its example names a real indexed tool: a placeholder like "ns.tool" gets
+// copied literally.
+func indexTools(example string) string {
+	return `  /**
+   * Every tool, declared or indexed, to search with code when you can't spot
+   * the one you need. For example:
+   * tools.$catalog.filter(t => /issue/i.test(t.description)).map(t => t.name + ": " + t.description).join("\n")
+   */
+  $catalog: { name: string; description: string; signature: string }[];
+  /**
+   * Asks for the documentation of indexed tools, named exactly as the index
+   * lists them, e.g. tools.$docs(` + strconv.Quote(example) + `). Ask for every
+   * tool you plan to use at once. It comes back under [documentation] with
+   * this script's result, and the tools run from the next script on.
+   */
+  $docs(...names: string[]): string;
+`
 }
 
 // byRecency sorts tools in recent's order, most recent first; the rest
@@ -96,43 +130,57 @@ func byRecency(tools []tool.Tool, recent []string) []tool.Tool {
 	return out
 }
 
-// group is one top-level namespace; name is "" for top-level functions.
+// partition splits tools, in order, into those whose declarations fit
+// within budget and the rest. A tool too big for what's left is skipped,
+// so later smaller ones can still fit.
+func partition(tools []tool.Tool, budget int) (full, indexed []tool.Tool) {
+	used := 0
+	for _, t := range tools {
+		// Alone, a tool's declaration carries the wrapping of its
+		// namespaces, which declared together they share: an overestimate
+		// that keeps the total within budget.
+		size := len(render([]tool.Tool{t}))
+		if budget <= 0 || used+size <= budget {
+			full = append(full, t)
+			used += size
+			continue
+		}
+		indexed = append(indexed, t)
+	}
+	return full, indexed
+}
+
+// namespace returns a tool's top-level namespace, "" for a top-level function.
+func namespace(name string) string {
+	ns, _, found := strings.Cut(name, ".")
+	if !found {
+		return ""
+	}
+	return ns
+}
+
+// group is one top-level namespace's tools; name is "" for top-level functions.
 type group struct {
 	name  string
 	tools []tool.Tool
 }
 
-// partition groups tools by top-level namespace, in order of first
-// appearance, and splits the groups into those that fit within budget and
-// the rest. A group too big for what's left is skipped, so later smaller
-// ones can still fit.
-func partition(tools []tool.Tool, budget int) (full, indexed []group) {
+// byNamespace groups tools by top-level namespace, in order of first
+// appearance, keeping their order within each.
+func byNamespace(tools []tool.Tool) []group {
 	var groups []group
 	pos := map[string]int{}
 	for _, t := range tools {
-		top, _, _ := strings.Cut(t.Name, ".")
-		if !strings.Contains(t.Name, ".") {
-			top = "" // top-level functions form their own group
-		}
-		i, ok := pos[top]
+		ns := namespace(t.Name)
+		i, ok := pos[ns]
 		if !ok {
 			i = len(groups)
-			pos[top] = i
-			groups = append(groups, group{name: top})
+			pos[ns] = i
+			groups = append(groups, group{name: ns})
 		}
 		groups[i].tools = append(groups[i].tools, t)
 	}
-	used := 0
-	for _, g := range groups {
-		size := len(render(g.tools))
-		if budget <= 0 || used+size <= budget {
-			full = append(full, g)
-			used += size
-			continue
-		}
-		indexed = append(indexed, g)
-	}
-	return full, indexed
+	return groups
 }
 
 // quote marks text as quoted, line by line, so headings in it can't pose as

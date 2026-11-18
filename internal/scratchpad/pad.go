@@ -27,6 +27,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode"
 	"unicode/utf8"
 
 	"github.com/dop251/goja"
@@ -76,13 +77,13 @@ type Options struct {
 	// Stop, Reset, or Close dropped the job first. Calls are serialized.
 	OnJobDone func(id string, r Result)
 	// DeclBudget caps, in bytes, the full TypeScript declarations in the
-	// run_code description; namespaces past it are indexed, one line per
-	// tool. Calls to an indexed tool are refused until a script result has
+	// run_code description; tools past it are indexed, one line each.
+	// Calls to an indexed tool are refused until a script result has
 	// carried its full documentation (Result.Docs), so the model never runs
 	// a tool it has only seen as an index entry. Recently used tools (per
-	// Registry.Recent, as of the pad's creation) come first, so their
-	// namespaces are the first to get full declarations. Zero means
-	// DefaultDeclBudget; negative means unlimited.
+	// Registry.Recent, as of the pad's creation) come first, so they're the
+	// first to get full declarations. Zero means DefaultDeclBudget;
+	// negative means unlimited.
 	DeclBudget int
 	// Guidance maps top-level namespaces to notes from their provider, such
 	// as an MCP server's instructions. Notes for fully declared namespaces
@@ -190,6 +191,7 @@ type runtime struct {
 
 // script collects one Run's console output.
 type script struct {
+	code string // the source run, which includes the model's code
 	mu   sync.Mutex
 	logs []string
 }
@@ -413,7 +415,7 @@ func (p *Pad) Run(ctx context.Context, code string) (Result, error) {
 }
 
 func (p *Pad) runOn(ctx context.Context, rt *runtime, src string) (Result, bool, error) {
-	s := &script{}
+	s := &script{code: src}
 	done := make(chan Result, 1)
 	rt.active.Add(1)
 	var settled atomic.Bool
@@ -516,7 +518,7 @@ func (p *Pad) report(s *script, r Result) Result {
 	s.mu.Lock()
 	r.Logs = s.logs
 	s.mu.Unlock()
-	r.Docs = p.takeDocs()
+	r.Docs = p.takeDocs(s.code)
 	return r
 }
 
@@ -722,12 +724,30 @@ func (p *Pad) refuse(name string) bool {
 
 // takeDocs returns the documentation of refused tools, plus the guidance
 // of their namespaces not shown before, and marks it all shown: the caller
-// must return it to the model.
-func (p *Pad) takeDocs() string {
+// must return it to the model. If anything is documented, so is every other
+// undocumented tool that code, the script being reported, mentions: one
+// refusal then covers the whole script, rather than one tool per rerun.
+func (p *Pad) takeDocs(code string) string {
 	p.disclosedMu.Lock()
 	defer p.disclosedMu.Unlock()
+	if len(p.pending) == 0 {
+		return ""
+	}
+	words := map[string]bool{}
+	for _, w := range strings.FieldsFunc(code, func(r rune) bool {
+		return !(r == '_' || r == '$' || r == '-' || unicode.IsLetter(r) || unicode.IsDigit(r))
+	}) {
+		words[w] = true
+	}
+	var mentioned []string
+	for name := range p.layout.docs {
+		if !slices.Contains(p.pending, name) && mentions(words, name) {
+			mentioned = append(mentioned, name)
+		}
+	}
+	slices.Sort(mentioned) // map order is random; results shouldn't be
 	var b strings.Builder
-	for _, name := range p.pending {
+	for _, name := range append(p.pending, mentioned...) {
 		b.WriteString(p.layout.docs[name])
 		delete(p.layout.docs, name)
 		ns, _, _ := strings.Cut(name, ".")
@@ -739,6 +759,19 @@ func (p *Pad) takeDocs() string {
 	}
 	p.pending = nil
 	return b.String()
+}
+
+// mentions reports whether every part of a dotted tool name is among a
+// script's words. It reads names the way a script can spell them,
+// tools.ns.tool, tools["ns"].tool, or through an alias of tools.ns, and errs
+// toward documenting a tool the script didn't need over missing one it did.
+func mentions(words map[string]bool, name string) bool {
+	for _, part := range strings.Split(name, ".") {
+		if !words[part] {
+			return false
+		}
+	}
+	return true
 }
 
 // argsJSON converts a JS argument to a JSON object; undefined becomes {}.
