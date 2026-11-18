@@ -97,6 +97,9 @@ type Toolbox interface {
 
 // Hooks route a toolbox's asynchronous output back into its session.
 type Hooks struct {
+	// Session is the session's ID, e.g. for tools whose effects belong to
+	// a conversation.
+	Session string
 	// Emit reports events such as nested tool calls. Safe for concurrent use.
 	Emit func(Event)
 	// Deliver queues text for the model, e.g. a finished background job.

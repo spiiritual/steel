@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 	"syscall"
+	_ "time/tzdata" // schedules' zones, wherever steel runs
 
 	"github.com/spiiritual/steel/internal/agent"
 	"github.com/spiiritual/steel/internal/bashcheck"
@@ -18,6 +19,7 @@ import (
 	"github.com/spiiritual/steel/internal/llm/openai"
 	"github.com/spiiritual/steel/internal/mcp"
 	"github.com/spiiritual/steel/internal/memory"
+	"github.com/spiiritual/steel/internal/schedule"
 	"github.com/spiiritual/steel/internal/scratchpad"
 	"github.com/spiiritual/steel/internal/tool"
 	"github.com/spiiritual/steel/internal/usage"
@@ -123,6 +125,19 @@ func run() error {
 		mem, system = opened.memory, opened.system
 		builtin = append(builtin, opened.tools...)
 	}
+	sched, err := schedule.Open(schedule.Options{
+		Path:   filepath.Join(filepath.Dir(*o.configPath), "schedules.json"),
+		Places: bot,
+		Logf: func(format string, args ...any) {
+			fmt.Fprintf(os.Stderr, "steel: "+format+"\n", args...)
+		},
+	})
+	if err != nil {
+		return err
+	}
+	defer sched.Close() // after sessions.Close, which ends the runs it waits on
+	builtin = append(builtin, schedule.Tools(sched)...)
+	bot.SetSchedules(scheduleList{sched})
 	tools := tool.NewRegistry(withoutCollisions(builtin, servers.Tools())...)
 	// recent.json sits next to the config, so a test config elsewhere keeps
 	// its own history.
@@ -159,8 +174,11 @@ func run() error {
 		return err
 	}
 	defer sessions.Close() // cancels whatever is still running
+	sched.Start(scheduleRunner{sessions})
 
 	err = bot.Run(runCtx, sessions)
+	// Before draining, so no new run starts.
+	sched.Stop()
 	if runCtx.Err() != nil && ctx.Err() == nil { // SIGTERM, not Ctrl-C
 		fmt.Fprintf(os.Stderr, "steel: finishing running work (up to %s; SIGTERM or Ctrl-C again to quit now)\n", *o.drain)
 		again, stopAgain := signal.NotifyContext(ctx, syscall.SIGTERM)
@@ -225,6 +243,7 @@ func newPad(tools *tool.Registry, guidance map[string]string, toolBudget int, h 
 		Approver: func(ctx context.Context, a tool.Approval) (bool, error) {
 			return h.Approve(ctx, a.Tool, a.Action, a.Reasons)
 		},
+		Caller: h.Session,
 		OnCall: func(e scratchpad.CallEvent) {
 			if !e.Done {
 				h.Emit(agent.ToolStart{Name: e.Name, Args: e.Args, Nested: true})
@@ -237,3 +256,32 @@ func newPad(tools *tool.Registry, guidance map[string]string, toolBudget int, h 
 		},
 	})
 }
+
+// scheduleRunner runs schedules in sessions.
+type scheduleRunner struct{ *agent.Sessions }
+
+func (r scheduleRunner) Start(ctx context.Context, id, text string, notes []string) (string, error) {
+	reply, err := r.Sessions.Start(ctx, id, text, notes)
+	if errors.Is(err, agent.ErrBusy) {
+		err = schedule.ErrBusy
+	}
+	return reply, err
+}
+
+// scheduleList shows schedules in Telegram's /schedules.
+type scheduleList struct{ *schedule.Scheduler }
+
+func (l scheduleList) Overview() []telegram.ScheduleEntry {
+	var out []telegram.ScheduleEntry
+	for _, sc := range l.List() {
+		out = append(out, telegram.ScheduleEntry{ID: sc.ID, Name: sc.Name, Text: sc.Describe(), From: sc.From})
+	}
+	return out
+}
+
+func (l scheduleList) CancelSchedule(ctx context.Context, id string) (string, error) {
+	sc, err := l.Cancel(ctx, id)
+	return sc.Name, err
+}
+
+var _ schedule.Runner = scheduleRunner{}

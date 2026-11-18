@@ -58,6 +58,68 @@ func (ss *Sessions) Send(id, text string) {
 	}
 }
 
+// Post shows text in session id's place and, if note isn't empty, adds
+// it to what the model reads next, without starting a turn.
+func (ss *Sessions) Post(id, text, note string) {
+	ss.inputMu.RLock()
+	defer ss.inputMu.RUnlock()
+	if s := ss.get(id); s != nil {
+		s.emit(Notice{Text: text})
+		if note != "" {
+			s.note(note)
+		}
+	}
+}
+
+// Prompt gives text to session id's model like a user message, and waits
+// until the turn that reads it ends or ctx does, returning its last reply.
+func (ss *Sessions) Prompt(ctx context.Context, id, text string) (string, error) {
+	return ss.await(ctx, id, func(s *Session) (<-chan TurnResult, error) { return s.prompt(text) })
+}
+
+// Start begins a new conversation in session id with notes and text, and
+// waits like Prompt. If the session has work it changes nothing and
+// returns ErrBusy.
+func (ss *Sessions) Start(ctx context.Context, id, text string, notes []string) (string, error) {
+	return ss.await(ctx, id, func(s *Session) (<-chan TurnResult, error) { return s.start(text, notes) })
+}
+
+// await queues input with queue and waits for the turn that reads it.
+// Like user input, it's refused once Drain starts.
+func (ss *Sessions) await(ctx context.Context, id string, queue func(*Session) (<-chan TurnResult, error)) (string, error) {
+	ss.inputMu.RLock()
+	var ch <-chan TurnResult
+	var err error
+	if s := ss.get(id); s == nil || ss.draining {
+		err = errDropped
+	} else {
+		ch, err = queue(s)
+	}
+	ss.inputMu.RUnlock()
+	if err != nil {
+		return "", err
+	}
+	select {
+	case r := <-ch:
+		return r.Reply, r.Err
+	case <-ctx.Done():
+		return "", ctx.Err()
+	}
+}
+
+// Quiet reports whether session id is idle and has been for d.
+func (ss *Sessions) Quiet(id string, d time.Duration) bool {
+	ss.mu.Lock()
+	s, ok := ss.m[id]
+	ss.mu.Unlock()
+	if !ok {
+		return true
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return time.Since(s.lastUsed) >= d && !s.busyLocked()
+}
+
 // Answer passes the user's answer to an ApprovalRequest from session id,
 // reporting whether the request was still waiting for one.
 func (ss *Sessions) Answer(id, approvalID string, allow bool) bool {
@@ -82,8 +144,9 @@ func (ss *Sessions) get(id string) *Session {
 	return s
 }
 
-// Idle reports whether session id has no running turn, no queued input, and
-// no pending background work. Unknown sessions are idle.
+// Idle reports whether session id has no running turn, no queued input, no
+// question for the user and no pending background work. Unknown sessions
+// are idle.
 func (ss *Sessions) Idle(id string) bool {
 	ss.mu.Lock()
 	s, ok := ss.m[id]
@@ -93,7 +156,7 @@ func (ss *Sessions) Idle(id string) bool {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return !s.running && len(s.inbox) == 0 && (s.box == nil || !s.box.Busy())
+	return !s.busyLocked()
 }
 
 func (ss *Sessions) janitor() {

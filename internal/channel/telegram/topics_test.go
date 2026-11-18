@@ -2,6 +2,7 @@ package telegram
 
 import (
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -153,5 +154,20 @@ func TestIdleRendererIsRemoved(t *testing.T) {
 	eventually(t, "second message", func() bool { return len(f.texts("sendMessage")) == 2 })
 	if c := f.callsOf("sendMessage")[1]; num(c.Params["message_thread_id"]) != 7 {
 		t.Errorf("second message %v", c.Params)
+	}
+}
+
+func TestOwnTopicMessagesAreIgnoredQuietly(t *testing.T) {
+	f := newFakeAPI(t)
+	b, log, _ := testBot(t, f, 42)
+	start(t, b, &fakeSessions{})
+	u := inTopic(textUpdate(1, 9, 42, ""), 77, true)
+	m := u["message"].(map[string]any)
+	m["from"].(map[string]any)["is_bot"] = true
+	m["forum_topic_created"] = map[string]any{"name": "Digest"}
+	f.add(u)
+	eventually(t, "update handled", func() bool { return lastOffset(f) == 2 })
+	if strings.Contains(log.String(), "ignoring user") {
+		t.Errorf("log = %q", log.String())
 	}
 }

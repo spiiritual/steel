@@ -77,7 +77,8 @@ func placeOf(m *message) place {
 const greeting = "Hi, I'm steel. Send me a message to start.\n\n" +
 	"/stop stops what I'm doing\n" +
 	"/reset clears my scratchpad\n" +
-	"/new starts a new conversation"
+	"/new starts a new conversation\n" +
+	"/schedules lists what's scheduled"
 
 // Options configure a Bot.
 type Options struct {
@@ -92,10 +93,11 @@ type Options struct {
 
 // Bot is a Telegram channel.
 type Bot struct {
-	api     *client
-	allowed map[int64]bool
-	log     io.Writer
-	logMu   sync.Mutex
+	api       *client
+	allowed   map[int64]bool
+	schedules Schedules // nil: no /schedules
+	log       io.Writer
+	logMu     sync.Mutex
 
 	// Tunables; tests shorten them.
 	pollTimeout    time.Duration // getUpdates long-poll timeout
@@ -187,6 +189,7 @@ func (b *Bot) run(ctx context.Context, ss sender) error {
 		return err
 	}
 	b.logf("running as @%s", me.Username)
+	go b.setCommands(ctx) // only the menu waits on it
 
 	b.polling.Store(true)
 	defer b.polling.Store(false)
@@ -258,7 +261,9 @@ func (b *Bot) handle(ss sender, botName string, u update) {
 		return
 	}
 	m := u.Message
-	if m == nil || m.From == nil {
+	// Bots can't be allowed users. Telegram even sends steel its own topic
+	// service messages, which are no one to warn about.
+	if m == nil || m.From == nil || m.From.IsBot {
 		return
 	}
 	if !b.allowed[m.From.ID] {
@@ -294,6 +299,9 @@ func (b *Bot) handle(ss sender, botName string, u update) {
 	case "/start":
 		b.push(p, agent.Notice{Text: greeting})
 		return
+	case "/schedules":
+		b.push(p, b.scheduleList(p.chat))
+		return
 	case "/stop", "/new":
 		b.stop(ss, p, cmd)
 	case "/reset":
@@ -306,6 +314,33 @@ func (b *Bot) handle(ss sender, botName string, u update) {
 	if rest != "" {
 		b.push(p, userSent{})
 		ss.Send(sid, rest)
+	}
+}
+
+// botCommand is an entry in Telegram's command menu.
+type botCommand struct {
+	Command     string `json:"command"`
+	Description string `json:"description"`
+}
+
+// commands returns the menu: what handle understands.
+func (b *Bot) commands() []botCommand {
+	cs := []botCommand{
+		{"stop", "Stop what I'm doing"},
+		{"reset", "Clear my scratchpad"},
+		{"new", "Start a new conversation"},
+	}
+	if b.schedules != nil {
+		cs = append(cs, botCommand{"schedules", "List and cancel schedules"})
+	}
+	return cs
+}
+
+// setCommands makes Telegram's command menu match the commands, so it
+// can't drift from what steel understands. A failure only costs the menu.
+func (b *Bot) setCommands(ctx context.Context) {
+	if err := b.api.call(ctx, "setMyCommands", setMyCommandsParams{Commands: b.commands()}, nil, requestTimeout); err != nil && ctx.Err() == nil {
+		b.logf("setting the command menu: %v", err)
 	}
 }
 
@@ -327,6 +362,10 @@ func (b *Bot) answer(ss sender, q *callbackQuery) {
 	}
 	if q.From == nil || !b.allowed[q.From.ID] || q.Message == nil {
 		reply("")
+		return
+	}
+	if id, ok := strings.CutPrefix(q.Data, cancelSchedulePrefix); ok {
+		b.cancelSchedule(q, id, reply)
 		return
 	}
 	id, allow := strings.CutPrefix(q.Data, allowPrefix)

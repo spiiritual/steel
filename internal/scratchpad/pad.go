@@ -93,6 +93,8 @@ type Options struct {
 	// Approver, if set, is how tools ask the user to approve an action
 	// (tool.Approve). Without it, actions that need approval are refused.
 	Approver tool.Approver
+	// Caller names the session the pad belongs to, for tools (tool.Caller).
+	Caller string
 }
 
 // Result is the outcome of one script.
@@ -221,6 +223,9 @@ func (p *Pad) newRuntime() *runtime {
 	ctx := context.Background()
 	if p.opts.Approver != nil {
 		ctx = tool.WithApprover(ctx, p.opts.Approver)
+	}
+	if p.opts.Caller != "" {
+		ctx = tool.WithCaller(ctx, p.opts.Caller)
 	}
 	rt.ctx, rt.cancel = context.WithCancel(ctx)
 	rt.loop.Start()

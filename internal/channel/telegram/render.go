@@ -197,6 +197,9 @@ func (c *chat) apply(e any) {
 	case agent.Notice:
 		c.send(e.Text)
 		c.dirty = c.active // the message replaced the draft; bring it back
+	case buttons:
+		c.sendButtons(e)
+		c.dirty = c.active
 	case agent.ApprovalRequest:
 		c.flush() // what the model said so far explains the request
 		c.askApproval(e)
@@ -229,10 +232,20 @@ func (c *chat) flush() {
 
 // send delivers text as one or more messages. A sent message replaces the
 // draft, so the next draft gets a new ID.
-func (c *chat) send(text string) {
+func (c *chat) send(text string) { c.sendWith(text, nil) }
+
+// sendButtons sends a message with an inline keyboard.
+func (c *chat) sendButtons(m buttons) { c.sendWith(m.text, m.keyboard) }
+
+// sendWith sends text, split as needed, with kb under its last part.
+func (c *chat) sendWith(text string, kb *inlineKeyboard) {
 	parts := split(text, maxText)
 	for i, p := range parts {
-		err := c.b.api.callRetry(c.b.ctx, "sendMessage", sendMessageParams{ChatID: c.place.chat, MessageThreadID: c.place.topic, Text: p}, nil, requestTimeout, c.b.sendAttempts)
+		params := sendMessageParams{ChatID: c.place.chat, MessageThreadID: c.place.topic, Text: p}
+		if i == len(parts)-1 {
+			params.ReplyMarkup = kb
+		}
+		err := c.b.api.callRetry(c.b.ctx, "sendMessage", params, nil, requestTimeout, c.b.sendAttempts)
 		if err != nil {
 			if c.b.ctx.Err() == nil {
 				c.b.logf("%s: message not delivered: %v", c.place, err)

@@ -43,6 +43,7 @@ type (
 	}
 	user struct {
 		ID       int64  `json:"id"`
+		IsBot    bool   `json:"is_bot"`
 		Username string `json:"username"`
 	}
 	chatRef struct {
@@ -100,9 +101,10 @@ type (
 	// editMessageTextParams without ReplyMarkup removes the message's
 	// buttons.
 	editMessageTextParams struct {
-		ChatID    int64  `json:"chat_id"`
-		MessageID int64  `json:"message_id"`
-		Text      string `json:"text"`
+		ChatID      int64           `json:"chat_id"`
+		MessageID   int64           `json:"message_id"`
+		Text        string          `json:"text"`
+		ReplyMarkup *inlineKeyboard `json:"reply_markup,omitempty"`
 	}
 	editMessageReplyMarkupParams struct {
 		ChatID    int64 `json:"chat_id"`
@@ -288,3 +290,27 @@ func (c *client) callRetry(ctx context.Context, method string, params, out any, 
 		}
 	}
 }
+
+type setMyCommandsParams struct {
+	Commands []botCommand `json:"commands"`
+}
+
+// Topic methods.
+type (
+	createForumTopicParams struct {
+		ChatID int64  `json:"chat_id"`
+		Name   string `json:"name"`
+	}
+	forumTopic struct {
+		MessageThreadID int64 `json:"message_thread_id"`
+	}
+	editForumTopicParams struct {
+		ChatID          int64  `json:"chat_id"`
+		MessageThreadID int64  `json:"message_thread_id"`
+		Name            string `json:"name"`
+	}
+	deleteForumTopicParams struct {
+		ChatID          int64 `json:"chat_id"`
+		MessageThreadID int64 `json:"message_thread_id"`
+	}
+)

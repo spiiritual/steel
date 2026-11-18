@@ -43,7 +43,7 @@ type Session struct {
 
 	mu       sync.Mutex
 	history  []llm.Message
-	inbox    []llm.Message // starts a turn when non-empty
+	inbox    []queued      // starts a turn when non-empty
 	notes    []llm.Message // steel's notes for the model; sent with the next turn, never start one
 	running  bool
 	cancel   context.CancelFunc // cancels the running turn
@@ -56,6 +56,56 @@ type Session struct {
 	// approvals are the requests waiting for the user, by ID; each channel
 	// takes one answer.
 	approvals map[string]chan bool
+	// reading are the callers waiting for the running turn, which read
+	// their input; reply is its last reply so far.
+	reading []chan<- TurnResult
+	reply   string
+}
+
+// queued is input in the inbox, and where to send the result of the turn
+// that reads it, if someone waits for it.
+type queued struct {
+	msg  llm.Message
+	done chan<- TurnResult
+}
+
+// TurnResult is how the turn that read some input ended: its last reply,
+// and its error.
+type TurnResult struct {
+	Reply string
+	Err   error
+}
+
+// ErrBusy means a session has work, so a new conversation can't start.
+var ErrBusy = errors.New("session busy")
+
+// errDropped is the result of input that never reached the model.
+var errDropped = errors.New("dropped before the model read it: stopped, or steel is shutting down")
+
+// errStopped is the result of a turn stopped before it finished.
+var errStopped = errors.New("stopped before it finished: by the user, or steel is shutting down")
+
+// steelNote is a message from steel, not the user, for the model.
+func steelNote(text string) llm.Message {
+	return llm.Message{Role: llm.RoleUser, Content: "[steel] " + text}
+}
+
+// waiters returns the channels waiting for qs.
+func waiters(qs []queued) []chan<- TurnResult {
+	var chs []chan<- TurnResult
+	for _, q := range qs {
+		if q.done != nil {
+			chs = append(chs, q.done)
+		}
+	}
+	return chs
+}
+
+// busyLocked reports whether the session has work: a turn, input, a
+// question for the user or background jobs. Callers hold s.mu.
+func (s *Session) busyLocked() bool {
+	// Busy is safe under s.mu (see the lock order).
+	return s.running || len(s.inbox) > 0 || len(s.approvals) > 0 || (s.box != nil && s.box.Busy())
 }
 
 func newSession(id string, cfg *Config, emit func(Event)) *Session {
@@ -111,14 +161,7 @@ func (s *Session) Send(text string) {
 	case "/new":
 		s.stop()
 		s.mu.Lock()
-		s.gen++
-		s.history = s.fresh()
-		s.notes, s.evicted = nil, false
-		// A new toolbox, not a reset one: what a toolbox remembers about the
-		// conversation (e.g. which tools' docs the model has seen) must go
-		// with it.
-		box := s.box
-		s.box = nil
+		box := s.renew()
 		s.mu.Unlock()
 		if box != nil {
 			box.Close()
@@ -128,6 +171,52 @@ func (s *Session) Send(text string) {
 	default:
 		s.enqueue(llm.Message{Role: llm.RoleUser, Content: text})
 	}
+}
+
+// renew starts a new conversation, returning the old toolbox for the
+// caller to close once s.mu is released. Callers hold s.mu.
+func (s *Session) renew() Toolbox {
+	s.gen++
+	s.history = s.fresh()
+	s.notes, s.evicted = nil, false
+	// A new toolbox, not a reset one: what a toolbox remembers about the
+	// conversation (e.g. which tools' docs the model has seen) must go
+	// with it.
+	box := s.box
+	s.box = nil
+	return box
+}
+
+// prompt queues text for the model like a user message, returning where
+// the result of the turn that reads it arrives.
+func (s *Session) prompt(text string) (<-chan TurnResult, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.enqueueLocked(llm.Message{Role: llm.RoleUser, Content: text}, true)
+}
+
+// start begins a new conversation with notes and text, unless the session
+// has work (ErrBusy).
+func (s *Session) start(text string, notes []string) (<-chan TurnResult, error) {
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return nil, errDropped
+	}
+	if s.busyLocked() {
+		s.mu.Unlock()
+		return nil, ErrBusy
+	}
+	box := s.renew()
+	for _, n := range notes {
+		s.notes = append(s.notes, steelNote(n))
+	}
+	ch, err := s.enqueueLocked(llm.Message{Role: llm.RoleUser, Content: text}, true)
+	s.mu.Unlock()
+	if box != nil {
+		box.Close()
+	}
+	return ch, err
 }
 
 // approve asks the user to approve a tool's action and waits for the
@@ -191,21 +280,42 @@ func (s *Session) deliver(text string) {
 func (s *Session) note(text string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.notes = append(s.notes, llm.Message{Role: llm.RoleUser, Content: "[steel] " + text})
+	s.notes = append(s.notes, steelNote(text))
 }
 
 func (s *Session) enqueue(m llm.Message) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.enqueueLocked(m, false)
+}
+
+// enqueueLocked adds m to the inbox, starting a turn if none is running.
+// With wait, it returns a channel for the result of the turn that reads
+// m. Callers hold s.mu.
+func (s *Session) enqueueLocked(m llm.Message, wait bool) (<-chan TurnResult, error) {
 	if s.closed {
-		return
+		return nil, errDropped
 	}
-	s.inbox = append(s.inbox, m)
+	var ch chan TurnResult
+	q := queued{msg: m}
+	if wait {
+		ch = make(chan TurnResult, 1)
+		q.done = ch
+	}
+	s.inbox = append(s.inbox, q)
 	s.lastUsed = time.Now()
 	if !s.running {
 		s.running = true
 		s.loopDone = make(chan struct{})
 		go s.loop(s.loopDone)
+	}
+	return ch, nil
+}
+
+// resolve sends r to every waiter in ws.
+func resolve(ws []chan<- TurnResult, r TurnResult) {
+	for _, w := range ws {
+		w <- r
 	}
 }
 
@@ -218,11 +328,13 @@ func (s *Session) stop() bool {
 		lost = box.Stop()
 	}
 	s.mu.Lock()
+	dropped := waiters(s.inbox)
 	s.inbox = nil
 	if s.cancel != nil {
 		s.cancel()
 	}
 	s.mu.Unlock()
+	resolve(dropped, TurnResult{Err: errDropped})
 	return lost
 }
 
@@ -244,16 +356,24 @@ func (s *Session) loop(done chan struct{}) {
 		}
 		ctx, cancel := context.WithCancel(context.Background())
 		s.cancel = cancel
+		s.reply = ""
 		gen := s.gen
 		s.mu.Unlock()
 
 		err := s.turn(ctx, gen)
+		result := err
 		if ctx.Err() != nil {
 			err = nil // stopped by the user, who already got a Notice
+			result = errStopped
 		}
 		cancel()
 		s.save()
+		s.mu.Lock()
+		read, reply := s.reading, s.reply
+		s.reading = nil
+		s.mu.Unlock()
 		s.emit(TurnDone{Err: err})
+		resolve(read, TurnResult{Reply: reply, Err: result})
 	}
 }
 
@@ -292,6 +412,9 @@ func (s *Session) turn(ctx context.Context, gen int) error {
 		}
 		if reply.Content != "" {
 			s.emit(Reply{Text: reply.Content})
+			s.mu.Lock()
+			s.reply = reply.Content
+			s.mu.Unlock()
 		}
 		if !s.append(gen, reply) {
 			return nil
@@ -335,7 +458,7 @@ func (s *Session) toolbox() Toolbox {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.box == nil && s.cfg.NewToolbox != nil && !s.closed {
-		s.box = s.cfg.NewToolbox(Hooks{Emit: s.emit, Deliver: s.deliver, Approve: s.approve})
+		s.box = s.cfg.NewToolbox(Hooks{Session: s.id, Emit: s.emit, Deliver: s.deliver, Approve: s.approve})
 		if s.evicted {
 			s.evicted = false
 			s.notes = append(s.notes, llm.Message{Role: llm.RoleUser, Content: scratchpadClosed})
@@ -353,7 +476,10 @@ func (s *Session) drain(gen int) ([]llm.Message, bool) {
 		return nil, false
 	}
 	s.history = append(s.history, s.notes...)
-	s.history = append(s.history, s.inbox...)
+	for _, q := range s.inbox {
+		s.history = append(s.history, q.msg)
+	}
+	s.reading = append(s.reading, waiters(s.inbox)...)
 	s.notes, s.inbox = nil, nil
 	return slices.Clone(s.history), true
 }
@@ -528,8 +654,16 @@ func (s *Session) wake(ctx context.Context, gen int) error {
 	if err != nil {
 		// The input waits for the next turn, which tries again; left in
 		// the inbox, it would start one now, and fail again, forever.
+		// Input someone waits for is dropped instead: they're told it
+		// failed, so it mustn't reach the model later.
 		s.mu.Lock()
-		s.notes, s.inbox = append(s.notes, s.inbox...), nil
+		for _, q := range s.inbox {
+			if q.done == nil {
+				s.notes = append(s.notes, q.msg)
+			}
+		}
+		s.reading = append(s.reading, waiters(s.inbox)...)
+		s.inbox = nil
 		s.mu.Unlock()
 		return fmt.Errorf("memory: %w", err)
 	}
