@@ -33,8 +33,10 @@ const (
 	maxInstructions = 2000
 )
 
-// Client holds connections to MCP servers.
+// Client holds connections to MCP servers. Servers can be added and
+// removed while it's in use; it's safe for concurrent use.
 type Client struct {
+	mu      sync.Mutex
 	servers []*server // sorted by name
 }
 
@@ -327,46 +329,101 @@ func contentText(content []sdk.Content) string {
 	return strings.Join(parts, "\n")
 }
 
-// Tools returns every connected server's tools, grouped by server name.
-func (c *Client) Tools() []tool.Tool {
-	var out []tool.Tool
+// Server is a connected server.
+type Server struct {
+	Name      string
+	Namespace string      // its tools' JS namespace: tools.<Namespace>.*
+	Tools     []tool.Tool // in that namespace
+	Guidance  string      // its instructions, capped; "" if none
+}
+
+func (s *server) public() Server {
+	return Server{Name: s.name, Namespace: s.ns, Tools: s.tools, Guidance: capGuidance(s.instructions)}
+}
+
+// Servers returns the connected servers, sorted by name.
+func (c *Client) Servers() []Server {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	var out []Server
 	for _, s := range c.servers {
-		out = append(out, s.tools...)
+		out = append(out, s.public())
 	}
 	return out
 }
 
-// Guidance returns each server's instructions, capped, keyed by the
-// namespace its tools live in ("github" for tools.github.*). Servers without
-// instructions are left out.
-func (c *Client) Guidance() map[string]string {
-	out := map[string]string{}
-	for _, s := range c.servers {
-		text := strings.TrimSpace(s.instructions)
-		if text == "" {
-			continue
-		}
-		if len(text) > maxInstructions {
-			cut := maxInstructions
-			for cut > 0 && !utf8.RuneStart(text[cut]) {
-				cut--
-			}
-			text = text[:cut] + " [truncated]"
-		}
-		out[s.ns] = text
+// Add connects to one more server, named name, unless one by that name is
+// connected. The warnings are tools that couldn't be adapted.
+func (c *Client) Add(ctx context.Context, name string, cfg ServerConfig, lookup Lookup) (Server, []error, error) {
+	if c.Connected(name) {
+		return Server{}, nil, fmt.Errorf("server %q is already connected", name)
 	}
-	return out
+	s, warn, err := dial(ctx, name, cfg, lookup)
+	if err != nil {
+		return Server{}, warn, err
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if slices.ContainsFunc(c.servers, func(o *server) bool { return o.name == name }) {
+		s.session.Close() // another Add won meanwhile
+		return Server{}, warn, fmt.Errorf("server %q is already connected", name)
+	}
+	c.servers = append(c.servers, s)
+	slices.SortFunc(c.servers, func(a, b *server) int { return cmp.Compare(a.name, b.name) })
+	return s.public(), warn, nil
+}
+
+// Remove disconnects server name, reporting whether it was connected.
+func (c *Client) Remove(name string) bool {
+	c.mu.Lock()
+	i := slices.IndexFunc(c.servers, func(s *server) bool { return s.name == name })
+	if i < 0 {
+		c.mu.Unlock()
+		return false
+	}
+	s := c.servers[i]
+	c.servers = slices.Delete(c.servers, i, i+1)
+	c.mu.Unlock()
+	s.session.Close()
+	return true
+}
+
+// Connected reports whether server name is connected.
+func (c *Client) Connected(name string) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return slices.ContainsFunc(c.servers, func(s *server) bool { return s.name == name })
+}
+
+// capGuidance trims a server's instructions and caps their length.
+func capGuidance(text string) string {
+	text = strings.TrimSpace(text)
+	if len(text) > maxInstructions {
+		cut := maxInstructions
+		for cut > 0 && !utf8.RuneStart(text[cut]) {
+			cut--
+		}
+		text = text[:cut] + " [truncated]"
+	}
+	return text
 }
 
 // Close disconnects from every server concurrently, stopping stdio server
 // processes.
 func (c *Client) Close() {
+	c.mu.Lock()
+	servers := c.servers
+	c.servers = nil
+	c.mu.Unlock()
 	var wg sync.WaitGroup
-	for _, s := range c.servers {
+	for _, s := range servers {
 		wg.Go(func() { s.session.Close() })
 	}
 	wg.Wait()
 }
+
+// Namespace is the JS namespace server name's tools get: tools.<it>.*.
+func Namespace(name string) string { return ident(name) }
 
 var nonIdent = regexp.MustCompile(`[^\p{L}\p{N}_$]+`)
 

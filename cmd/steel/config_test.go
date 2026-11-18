@@ -39,8 +39,8 @@ func TestSettingPrecedence(t *testing.T) {
 }
 
 // The user's secrets live in secrets.env, apart from steel's own variables
-// in .env; ones older versions kept in .env move there. mcpServers can
-// expand them, but steel's own lookups never see them.
+// in .env; ones older versions kept in .env move there. Steel's own
+// lookups never see them.
 func TestUserSecretsMoveToSecretsEnv(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "config.json")
@@ -57,8 +57,8 @@ func TestUserSecretsMoveToSecretsEnv(t *testing.T) {
 	if b, _ := os.ReadFile(filepath.Join(dir, "secrets.env")); string(b) != "PIN=12\nGH_TOKEN=ghp_1\n" {
 		t.Errorf("secrets.env:\n%s", b)
 	}
-	if v, ok := env.expand("GH_TOKEN"); !ok || v != "ghp_1" {
-		t.Errorf("expand GH_TOKEN = %q, %v", v, ok)
+	if src := env.source("GH_TOKEN"); src != "secrets.env" {
+		t.Errorf("GH_TOKEN is set in %q", src)
 	}
 	if _, ok := env.lookup("GH_TOKEN"); ok {
 		t.Error("steel's own lookup sees a user secret")

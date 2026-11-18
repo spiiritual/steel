@@ -92,7 +92,30 @@ func run() error {
 	runCtx, stopRun := signal.NotifyContext(ctx, syscall.SIGTERM)
 	defer stopRun()
 
-	servers, warnings := mcp.Connect(runCtx, mcpServers, env.expand) // either signal interrupts a slow server
+	// The model uses the user's secrets; steel's own tokens, wherever they
+	// come from, are only redacted from tool results.
+	tokens := map[string]string{}
+	for _, sc := range secrets {
+		v, _ := env.lookup(sc.env)
+		tokens[sc.env] = strings.TrimSpace(v)
+	}
+	store, err := secret.Open(secretsPath(*o.configPath), secret.Options{Redact: tokens})
+	if err != nil {
+		return err
+	}
+	// ${NAME} in a server's config: steel's environment and .env, then the
+	// user's secrets as they are now, so one entered a moment ago works.
+	// Never steel's own tokens: the model can write a server's config.
+	expand := func(name string) (string, bool) {
+		if _, own := tokens[name]; own {
+			return "", false
+		}
+		if v, ok := env.lookup(name); ok {
+			return v, true
+		}
+		return store.Value(name)
+	}
+	servers, warnings := mcp.Connect(runCtx, mcpServers, expand) // either signal interrupts a slow server
 	defer servers.Close()
 	for _, w := range warnings {
 		fmt.Fprintln(os.Stderr, "steel:", w)
@@ -113,17 +136,6 @@ func run() error {
 	}
 	check := func(cmd string) []string {
 		return bashcheck.Check(cmd, bashcheck.Options{Dir: cwd, Home: home, Protected: protected})
-	}
-	// The model uses the user's secrets; steel's own tokens, wherever they
-	// come from, are only redacted from tool results.
-	tokens := map[string]string{}
-	for _, sc := range secrets {
-		v, _ := env.lookup(sc.env)
-		tokens[sc.env] = strings.TrimSpace(v)
-	}
-	store, err := secret.Open(secretsPath(*o.configPath), secret.Options{Redact: tokens})
-	if err != nil {
-		return err
 	}
 	bot.SetSecrets(store)
 	builtin := []tool.Tool{tool.Bash(cwd, check)}
@@ -152,7 +164,15 @@ func run() error {
 	defer sched.Close() // after sessions.Close, which ends the runs it waits on
 	builtin = append(builtin, schedule.Tools(sched)...)
 	bot.SetSchedules(scheduleList{sched})
-	tools := tool.NewRegistry(withoutCollisions(builtin, servers.Tools())...)
+	st := &serverTools{configPath: *o.configPath, client: servers, lookup: expand}
+	tools := tool.NewRegistry(append(builtin, st.tools()...)...)
+	st.registry = tools
+	for _, s := range servers.Servers() {
+		if err := tools.Add(s.Namespace, s.Guidance, s.Tools...); err != nil {
+			fmt.Fprintf(os.Stderr, "steel: skipping MCP server %s: %v; rename it in the config\n", s.Name, err)
+			servers.Remove(s.Name)
+		}
+	}
 	// recent.json sits next to the config, so a test config elsewhere keeps
 	// its own history.
 	recent, err := tool.LoadRecent(filepath.Join(filepath.Dir(*o.configPath), "recent.json"), func(err error) {
@@ -162,18 +182,12 @@ func run() error {
 		fmt.Fprintln(os.Stderr, "steel: ignoring recently used tools:", err)
 	}
 	tools.TrackRecent(recent)
-	// A server whose namespace a builtin owns had its tools skipped; its
-	// guidance would otherwise describe the builtin.
-	guidance := servers.Guidance()
-	for _, t := range builtin {
-		delete(guidance, namespace(t.Name))
-	}
 	sessions, err := agent.NewSessions(agent.Config{
 		Provider:    usageLog.Track(logCalls(provider, "turn", os.Stderr), "turn"),
 		Model:       *o.model,
 		System:      system,
 		Memory:      mem,
-		NewToolbox:  func(h agent.Hooks) agent.Toolbox { return newPad(tools, guidance, store, *o.toolBudget, h) },
+		NewToolbox:  func(h agent.Hooks) agent.Toolbox { return newPad(tools, store, *o.toolBudget, h) },
 		Dir:         *o.dataDir,
 		IdleTimeout: *o.idle,
 	}, func(id string, e agent.Event) {
@@ -206,44 +220,9 @@ func run() error {
 	return err
 }
 
-// withoutCollisions appends extra to builtin, skipping (with a warning) tools
-// in a namespace a builtin uses, e.g. from an MCP server named "fs", and any
-// tool whose name is already taken.
-func withoutCollisions(builtin, extra []tool.Tool) []tool.Tool {
-	reserved := map[string]bool{}
-	taken := map[string]bool{}
-	for _, t := range builtin {
-		reserved[namespace(t.Name)] = true
-		taken[t.Name] = true
-	}
-	warned := map[string]bool{}
-	for _, t := range extra {
-		if ns := namespace(t.Name); reserved[ns] {
-			if !warned[ns] {
-				warned[ns] = true
-				fmt.Fprintf(os.Stderr, "steel: skipping MCP tools in tools.%s: steel's built-in tools use that namespace; rename the server in the config\n", ns)
-			}
-			continue
-		}
-		if taken[t.Name] {
-			fmt.Fprintf(os.Stderr, "steel: skipping MCP tool %s: name already taken; rename the server in the config\n", t.Name)
-			continue
-		}
-		taken[t.Name] = true
-		builtin = append(builtin, t)
-	}
-	return builtin
-}
-
-// namespace returns a tool's top-level namespace: "shell" for "shell.bash".
-func namespace(name string) string {
-	ns, _, _ := strings.Cut(name, ".")
-	return ns
-}
-
 // newPad builds a session's scratchpad, routing its nested tool calls and
 // finished background jobs back into the session.
-func newPad(tools *tool.Registry, guidance map[string]string, secrets *secret.Store, toolBudget int, h agent.Hooks) *scratchpad.Pad {
+func newPad(tools *tool.Registry, secrets *secret.Store, toolBudget int, h agent.Hooks) *scratchpad.Pad {
 	declBudget := toolBudget * 4 // ~4 bytes per token
 	switch {
 	case toolBudget < 0:
@@ -253,7 +232,6 @@ func newPad(tools *tool.Registry, guidance map[string]string, secrets *secret.St
 	}
 	return scratchpad.New(tools, scratchpad.Options{
 		DeclBudget: declBudget,
-		Guidance:   guidance,
 		Approver: func(ctx context.Context, a tool.Approval) (bool, error) {
 			return h.Approve(ctx, a.Tool, a.Action, a.Reasons)
 		},

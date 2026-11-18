@@ -174,6 +174,17 @@ func (s *Store) Has(name string) (bool, error) {
 	return ok, nil
 }
 
+// Value returns secret name's value, read from the file as it is now, for
+// steel's own use: expanding ${NAME} in an MCP server's config. It must
+// never reach the model.
+func (s *Store) Value(name string) (string, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_ = s.loadLocked() // on error, use what was read before
+	v, ok := s.vars[name]
+	return v, ok
+}
+
 // CheckName reports why name can't be set, or nil if it can.
 func (s *Store) CheckName(name string) error { return ValidName(name) }
 

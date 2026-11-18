@@ -73,7 +73,7 @@ func byName(tools []tool.Tool) map[string]tool.Tool {
 
 func TestAdaptedTools(t *testing.T) {
 	c := startServer(t, "test-srv")
-	tools := byName(c.Tools())
+	tools := byName(c.Servers()[0].Tools)
 	ctx := context.Background()
 
 	add, ok := tools["test_srv.add"]
@@ -100,7 +100,7 @@ func TestAdaptedTools(t *testing.T) {
 		t.Errorf("fail err = %v", err)
 	}
 
-	if got := c.Guidance()["test_srv"]; got != "Use add for sums." {
+	if got := c.Servers()[0].Guidance; got != "Use add for sums." {
 		t.Errorf("guidance = %q", got)
 	}
 }
@@ -108,7 +108,7 @@ func TestAdaptedTools(t *testing.T) {
 // End to end: an MCP tool is just another function in the scratchpad.
 func TestMCPToolsInScratchpad(t *testing.T) {
 	c := startServer(t, "math")
-	pad := scratchpad.New(tool.NewRegistry(c.Tools()...), scratchpad.Options{})
+	pad := scratchpad.New(tool.NewRegistry(c.Servers()[0].Tools...), scratchpad.Options{})
 	defer pad.Close()
 
 	r, err := pad.Run(context.Background(), `
@@ -130,7 +130,7 @@ func TestIdent(t *testing.T) {
 }
 
 func TestStructuredResultsAreValidated(t *testing.T) {
-	tools := byName(startServer(t, "srv").Tools())
+	tools := byName(startServer(t, "srv").Servers()[0].Tools)
 	ctx := context.Background()
 
 	if _, err := tools["srv.bad_shape"].Run(ctx, json.RawMessage(`{}`)); err == nil || !strings.Contains(err.Error(), "doesn't match the tool's output schema") {

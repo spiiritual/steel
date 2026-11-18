@@ -42,7 +42,7 @@ func newLayout(tools []tool.Tool, budget int, recent []string, guidance map[stri
 	var notes strings.Builder
 	shown := map[string]bool{}
 	for _, t := range full {
-		ns := namespace(t.Name)
+		ns := tool.Namespace(t.Name)
 		if text := guidance[ns]; text != "" && ns != "" && !shown[ns] {
 			fmt.Fprintf(&notes, "tools.%s.*:\n%s\n", ns, quote(text))
 		}
@@ -150,15 +150,6 @@ func partition(tools []tool.Tool, budget int) (full, indexed []tool.Tool) {
 	return full, indexed
 }
 
-// namespace returns a tool's top-level namespace, "" for a top-level function.
-func namespace(name string) string {
-	ns, _, found := strings.Cut(name, ".")
-	if !found {
-		return ""
-	}
-	return ns
-}
-
 // group is one top-level namespace's tools; name is "" for top-level functions.
 type group struct {
 	name  string
@@ -171,7 +162,7 @@ func byNamespace(tools []tool.Tool) []group {
 	var groups []group
 	pos := map[string]int{}
 	for _, t := range tools {
-		ns := namespace(t.Name)
+		ns := tool.Namespace(t.Name)
 		i, ok := pos[ns]
 		if !ok {
 			i = len(groups)

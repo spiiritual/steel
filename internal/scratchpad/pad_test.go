@@ -361,9 +361,10 @@ func TestIndexedToolsDiscloseBeforeRunning(t *testing.T) {
 		Run: func(context.Context, json.RawMessage) (any, error) { return "wiped", nil }}
 	sibling := tool.Tool{Name: "t.peek", Description: "Looks.", Run: func(context.Context, json.RawMessage) (any, error) { return "peeked", nil }}
 	var ran atomic.Int32
-	p := New(tool.NewRegistry(shown, indexed, sibling), Options{
+	reg := tool.NewRegistry(shown)
+	reg.Add("t", "Wipes are permanent. Ask first.", indexed, sibling)
+	p := New(reg, Options{
 		DeclBudget: len(render([]tool.Tool{shown})), // room for "shown" only
-		Guidance:   map[string]string{"t": "Wipes are permanent. Ask first."},
 		OnCall: func(e CallEvent) {
 			if e.Done && e.Err == nil {
 				ran.Add(1)
@@ -472,5 +473,46 @@ func TestDocsLookupUnlocksWithoutRunning(t *testing.T) {
 	}
 	if r := run(t, p, `tools.$docs("t.nope")`); !strings.Contains(r.Error, `no tool named "t.nope"`) {
 		t.Errorf("unknown tool = %+v", r)
+	}
+}
+
+// Tools added while pads run (an MCP server connected at runtime) keep the
+// rule that nothing runs before its documentation reaches the model: the
+// script whose call added them gets their docs, with the namespace's
+// notes, and can use them next; another pad gets them refused, with docs,
+// on first use.
+func TestToolsAddedAtRuntime(t *testing.T) {
+	var reg *tool.Registry
+	hello := tool.Tool{Name: "x.hello", Description: "Say hello.", Signature: "(): Promise<string>",
+		Run: func(context.Context, json.RawMessage) (any, error) { return "hello", nil }}
+	reg = tool.NewRegistry(tool.Tool{Name: "t.connect", Run: func(ctx context.Context, _ json.RawMessage) (any, error) {
+		err := reg.Add("x", "Greets people.", hello)
+		tool.Disclose(ctx, "x.hello")
+		return "connected", err
+	}})
+	adder := New(reg, Options{})
+	defer adder.Close()
+	other := New(reg, Options{})
+	defer other.Close()
+
+	r := run(t, adder, `return await tools.t.connect()`)
+	if r.Error != "" || !strings.Contains(r.Docs, "hello(): Promise<string>") || !strings.Contains(r.Docs, "Greets people.") {
+		t.Errorf("adding script: %+v", r)
+	}
+	if r := run(t, adder, `return await tools.x.hello()`); r.Value != "hello" {
+		t.Errorf("next script: %+v", r)
+	}
+
+	r = run(t, other, `return await tools.x.hello()`)
+	if !strings.Contains(r.Error, "did not run") || !strings.Contains(r.Docs, "hello(): Promise<string>") {
+		t.Errorf("other pad, first use: %+v", r)
+	}
+	if r := run(t, other, `return await tools.x.hello()`); r.Value != "hello" {
+		t.Errorf("other pad, second use: %+v", r)
+	}
+
+	reg.Remove("x")
+	if r := run(t, adder, `return await tools.x.hello()`); !strings.Contains(r.Error, "unknown tool") {
+		t.Errorf("after removal: %+v", r)
 	}
 }

@@ -325,10 +325,10 @@ func editDistance(a, b string) int {
 	return prev[len(b)]
 }
 
-// environment is where steel looks up variables: its own environment, then
-// .env, and for mcpServers also secrets.env. It's a snapshot, so steel can
-// remove its tokens from the real environment and still expand them in
-// mcpServers.
+// environment is where steel looks up its own variables: its environment,
+// then .env. It's a snapshot, so steel can remove its tokens from the real
+// environment and still expand them in mcpServers. secrets holds
+// secrets.env, for steel config to list.
 type environment struct {
 	os, dotenv, secrets map[string]string
 }
@@ -369,17 +369,7 @@ func (e environment) lookup(name string) (string, bool) {
 	return v, ok
 }
 
-// expand looks name up for an mcpServers ${NAME}: like lookup, then the
-// user's secrets.
-func (e environment) expand(name string) (string, bool) {
-	if v, ok := e.lookup(name); ok {
-		return v, true
-	}
-	v, ok := e.secrets[name]
-	return v, ok
-}
-
-// source says where expand finds name.
+// source says where name is set, for steel config.
 func (e environment) source(name string) string {
 	switch {
 	case e.os[name] != "":

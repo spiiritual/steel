@@ -144,8 +144,11 @@ func TestGuidanceCapped(t *testing.T) {
 		{name: "b", ns: "b", instructions: strings.Repeat("y", 3*maxInstructions)},
 		{name: "c", ns: "c"},
 	}}
-	got := c.Guidance()
-	if len(got) != 2 || got["my_srv"] != "Use x" {
+	got := map[string]string{}
+	for _, s := range c.Servers() {
+		got[s.Namespace] = s.Guidance
+	}
+	if got["my_srv"] != "Use x" || got["c"] != "" {
 		t.Errorf("guidance = %q", got)
 	}
 	if b := got["b"]; len(b) > maxInstructions+20 || !strings.HasSuffix(b, "[truncated]") {
