@@ -31,6 +31,15 @@ type (
 		From      *user   `json:"from"`
 		Chat      chatRef `json:"chat"`
 		Text      string  `json:"text"`
+		// MessageThreadID is the topic, when IsTopicMessage. Without
+		// IsTopicMessage it can name a reply thread, which isn't a topic.
+		MessageThreadID int64 `json:"message_thread_id"`
+		IsTopicMessage  bool  `json:"is_topic_message"`
+		// Service messages about topics; nobody wrote them.
+		ForumTopicCreated  json.RawMessage `json:"forum_topic_created"`
+		ForumTopicEdited   json.RawMessage `json:"forum_topic_edited"`
+		ForumTopicClosed   json.RawMessage `json:"forum_topic_closed"`
+		ForumTopicReopened json.RawMessage `json:"forum_topic_reopened"`
 	}
 	user struct {
 		ID       int64  `json:"id"`
@@ -47,6 +56,11 @@ type (
 		DraftID flexInt `json:"draft_id"`
 	}
 )
+
+// service reports whether m is a service message about a topic.
+func (m *message) service() bool {
+	return m.ForumTopicCreated != nil || m.ForumTopicEdited != nil || m.ForumTopicClosed != nil || m.ForumTopicReopened != nil
+}
 
 // callbackQuery is a press of an inline keyboard button.
 type callbackQuery struct {
@@ -78,9 +92,10 @@ type (
 		AllowedUpdates []string `json:"allowed_updates"`
 	}
 	sendMessageParams struct {
-		ChatID      int64           `json:"chat_id"`
-		Text        string          `json:"text"`
-		ReplyMarkup *inlineKeyboard `json:"reply_markup,omitempty"`
+		ChatID          int64           `json:"chat_id"`
+		MessageThreadID int64           `json:"message_thread_id,omitempty"`
+		Text            string          `json:"text"`
+		ReplyMarkup     *inlineKeyboard `json:"reply_markup,omitempty"`
 	}
 	// editMessageTextParams without ReplyMarkup removes the message's
 	// buttons.
@@ -105,16 +120,18 @@ type (
 		CallbackData string `json:"callback_data"`
 	}
 	sendMessageDraftParams struct {
-		ChatID  int64 `json:"chat_id"`
-		DraftID int64 `json:"draft_id"`
+		ChatID          int64 `json:"chat_id"`
+		MessageThreadID int64 `json:"message_thread_id,omitempty"`
+		DraftID         int64 `json:"draft_id"`
 		// Text may be empty: Telegram then shows a "Thinking…" placeholder.
 		Text       string `json:"text"`
 		CanStop    bool   `json:"can_stop,omitempty"`
 		KeepOnStop bool   `json:"keep_on_stop,omitempty"`
 	}
 	sendChatActionParams struct {
-		ChatID int64  `json:"chat_id"`
-		Action string `json:"action"`
+		ChatID          int64  `json:"chat_id"`
+		MessageThreadID int64  `json:"message_thread_id,omitempty"`
+		Action          string `json:"action"`
 	}
 )
 

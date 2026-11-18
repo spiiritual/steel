@@ -15,9 +15,11 @@ type Sessions struct {
 	cfg  Config
 	emit func(id string, e Event)
 
-	// inputMu orders user input against Drain: Send holds it shared from
-	// checking draining until the session has the input, so once Drain
-	// holds it exclusively and sets draining, no input slips past.
+	// inputMu orders user input against Drain and retiring: Send holds it
+	// shared from checking draining until the session has the input, so
+	// once Drain holds it exclusively and sets draining, no input slips
+	// past, and the janitor holding it can retire a session that no Send
+	// is about to use.
 	inputMu  sync.RWMutex
 	draining bool // Drain started: user input is ignored
 
@@ -111,6 +113,37 @@ func (ss *Sessions) janitor() {
 			for _, s := range all {
 				s.evictIfIdle(ss.cfg.IdleTimeout)
 			}
+			ss.retireSettled()
+		}
+	}
+}
+
+// retireSettled drops settled sessions from the map, freeing their history;
+// each is loaded from its file again on its next message. Without this,
+// every chat and topic ever used would stay in memory until steel exits.
+func (ss *Sessions) retireSettled() {
+	// Skip this tick rather than wait behind a Send or Drain.
+	if !ss.inputMu.TryLock() {
+		return
+	}
+	defer ss.inputMu.Unlock()
+	ss.mu.Lock()
+	settled := map[string]*Session{}
+	for id, s := range ss.m {
+		if s.settled(ss.cfg.IdleTimeout) {
+			settled[id] = s
+		}
+	}
+	ss.mu.Unlock()
+	// With inputMu held, nothing adds sessions (only Send does) and no
+	// input reaches a settled one, which has no scratchpad or approvals to
+	// hear from either. So each stays settled while it is saved, outside
+	// ss.mu. Usually its file is already current and nothing is written.
+	for id, s := range settled {
+		if s.retire() {
+			ss.mu.Lock()
+			delete(ss.m, id)
+			ss.mu.Unlock()
 		}
 	}
 }

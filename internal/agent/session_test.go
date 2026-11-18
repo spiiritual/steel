@@ -270,6 +270,98 @@ func TestHistoryPersistsAcrossRestarts(t *testing.T) {
 	}
 }
 
+// After a restart the model hears that its scratchpad is gone, once, and
+// only if it had used it.
+func TestRestartTellsModelOnlyIfItUsedTheScratchpad(t *testing.T) {
+	dir := t.TempDir()
+	h1 := newHarness(t, Config{Dir: dir}, func(i int, _ context.Context, _ llm.Request) (llm.Message, error) {
+		if i == 0 {
+			return calls("echo"), nil
+		}
+		return text("ok"), nil
+	})
+	h1.ss.Send("c", "compute")
+	h1.waitTurn()
+	h1.ss.Close()
+
+	respond := func(int, context.Context, llm.Request) (llm.Message, error) { return text("ok"), nil }
+	h2 := newHarness(t, Config{Dir: dir}, respond)
+	h2.ss.Send("c", "back")
+	h2.waitTurn()
+	if got := roles(h2.llm.req(0).Messages); !strings.HasSuffix(got, "user:"+scratchpadClosed+" user:back") {
+		t.Errorf("not told: %s", got)
+	}
+	h2.ss.Close()
+
+	h3 := newHarness(t, Config{Dir: dir}, respond)
+	h3.ss.Send("c", "again")
+	h3.waitTurn()
+	if got := roles(h3.llm.req(0).Messages); strings.Count(got, scratchpadClosed) != 1 {
+		t.Errorf("told again: %s", got)
+	}
+}
+
+// boxClosed reports whether toolbox i was closed.
+func (h *harness) boxClosed(i int) bool {
+	b := h.box(i)
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.closed
+}
+
+// live reports whether session id is in memory.
+func (h *harness) live(id string) bool {
+	h.ss.mu.Lock()
+	defer h.ss.mu.Unlock()
+	_, ok := h.ss.m[id]
+	return ok
+}
+
+// An idle session leaves memory and comes back from its file, its
+// conversation intact, on its next message.
+func TestIdleSessionIsRetiredAndReloaded(t *testing.T) {
+	h := newHarness(t, Config{Dir: t.TempDir(), System: "sys", IdleTimeout: 20 * time.Millisecond},
+		func(int, context.Context, llm.Request) (llm.Message, error) { return text("ok"), nil })
+	h.ss.Send("c", "hi")
+	h.waitTurn()
+	waitFor(t, func() bool { return !h.live("c") })
+
+	h.ss.Send("c", "back")
+	h.waitTurn()
+	if got, want := roles(h.llm.req(1).Messages), "system:sys user:hi assistant:ok user:back"; got != want {
+		t.Errorf("got  %s\nwant %s", got, want)
+	}
+}
+
+// A note pending when a session retires is saved with it and still
+// reaches the model.
+func TestRetiredSessionKeepsPendingNote(t *testing.T) {
+	h := newHarness(t, Config{Dir: t.TempDir(), IdleTimeout: 20 * time.Millisecond},
+		func(int, context.Context, llm.Request) (llm.Message, error) { return text("ok"), nil })
+	h.ss.Send("c", "hi")
+	h.waitTurn()
+	h.ss.Send("c", "/reset")
+	waitFor(t, func() bool { return !h.live("c") })
+	h.ss.Send("c", "next")
+	h.waitTurn()
+	if got := roles(h.llm.req(1).Messages); !strings.Contains(got, "The user cleared the scratchpad") {
+		t.Errorf("note lost: %s", got)
+	}
+}
+
+// Without a history directory, nothing could bring a session back.
+func TestUnsavedSessionIsNeverRetired(t *testing.T) {
+	h := newHarness(t, Config{IdleTimeout: 20 * time.Millisecond},
+		func(int, context.Context, llm.Request) (llm.Message, error) { return text("ok"), nil })
+	h.ss.Send("c", "hi")
+	h.waitTurn()
+	waitFor(t, func() bool { return h.boxClosed(0) })
+	h.ss.retireSettled() // idle long enough: the box closing proves it
+	if !h.live("c") {
+		t.Error("session without a history directory was retired")
+	}
+}
+
 func TestNewClearsConversation(t *testing.T) {
 	h := newHarness(t, Config{System: "sys"}, func(int, context.Context, llm.Request) (llm.Message, error) { return text("ok"), nil })
 	h.ss.Send("c", "old")
@@ -294,15 +386,20 @@ func TestNewClearsConversation(t *testing.T) {
 }
 
 func TestIdleSessionLosesToolboxAndModelIsTold(t *testing.T) {
-	h := newHarness(t, Config{IdleTimeout: 50 * time.Millisecond}, func(int, context.Context, llm.Request) (llm.Message, error) { return text("ok"), nil })
+	h := newHarness(t, Config{IdleTimeout: 50 * time.Millisecond}, func(i int, _ context.Context, _ llm.Request) (llm.Message, error) {
+		if i == 0 {
+			return calls("echo"), nil // the model uses its scratchpad
+		}
+		return text("ok"), nil
+	})
 	h.ss.Send("c", "hi")
 	h.waitTurn()
-	waitFor(t, func() bool { b := h.box(0); b.mu.Lock(); defer b.mu.Unlock(); return b.closed })
+	waitFor(t, func() bool { return h.boxClosed(0) })
 
 	h.ss.Send("c", "still there?")
 	h.waitTurn()
-	msgs := h.llm.req(1).Messages
-	if got := roles(msgs[len(msgs)-2:]); !strings.HasPrefix(got, "user:[steel] The scratchpad was closed") || !strings.HasSuffix(got, "user:still there?") {
+	msgs := h.llm.req(2).Messages
+	if got, want := roles(msgs[len(msgs)-2:]), "user:"+scratchpadClosed+" user:still there?"; got != want {
 		t.Errorf("got %s", got)
 	}
 	h.mu.Lock()

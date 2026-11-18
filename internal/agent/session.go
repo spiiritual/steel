@@ -33,6 +33,10 @@ type Session struct {
 	emit func(Event)
 
 	saveMu sync.Mutex // serializes snapshot+write so the newest state wins
+	// saved is the history last written to (or read from) the file, as
+	// its generation and length: history only grows within a generation,
+	// so a match means the file is current. Guarded by mu.
+	savedGen, savedLen int
 	// keepFile is set when the saved history came from a newer steel: it
 	// isn't loaded, and isn't overwritten. Set before the session is used.
 	keepFile bool
@@ -46,7 +50,7 @@ type Session struct {
 	loopDone chan struct{}      // closed when the running loop exits
 	gen      int                // bumped by /new; turns from older generations stop writing
 	box      Toolbox
-	evicted  bool // box was closed for idleness; tell the model next turn
+	evicted  bool // the model's earlier scratchpad is gone; tell it when the next one opens
 	closed   bool
 	lastUsed time.Time
 	// approvals are the requests waiting for the user, by ID; each channel
@@ -57,7 +61,35 @@ type Session struct {
 func newSession(id string, cfg *Config, emit func(Event)) *Session {
 	s := &Session{id: id, cfg: cfg, emit: emit, lastUsed: time.Now()}
 	s.history = s.load()
+	s.savedLen = len(s.history)
+	// A saved conversation's scratchpad didn't survive: steel restarted, or
+	// the session was retired for idleness.
+	s.evicted = usedScratchpad(s.history)
 	return s
+}
+
+// scratchpadClosed is the note telling the model its scratchpad is gone.
+const scratchpadClosed = "[steel] The scratchpad was closed after inactivity or a restart; globals from earlier run_code calls are gone."
+
+// usedScratchpad reports whether the model has called tools since it was
+// last told its scratchpad was closed: only then can it expect state that
+// is gone.
+func usedScratchpad(history []llm.Message) bool {
+	for _, m := range slices.Backward(history) {
+		switch {
+		case len(m.ToolCalls) > 0:
+			return true
+		case m.Role == llm.RoleUser && m.Content == scratchpadClosed:
+			return false
+		}
+	}
+	return false
+}
+
+// started reports whether a conversation has begun: it holds more than the
+// system prompt.
+func started(history []llm.Message) bool {
+	return slices.ContainsFunc(history, func(m llm.Message) bool { return m.Role != llm.RoleSystem })
 }
 
 // Send handles text from the user: a command, or a message for the model.
@@ -306,7 +338,7 @@ func (s *Session) toolbox() Toolbox {
 		s.box = s.cfg.NewToolbox(Hooks{Emit: s.emit, Deliver: s.deliver, Approve: s.approve})
 		if s.evicted {
 			s.evicted = false
-			s.notes = append(s.notes, llm.Message{Role: llm.RoleUser, Content: "[steel] The scratchpad was closed after inactivity; globals from earlier run_code calls are gone."})
+			s.notes = append(s.notes, llm.Message{Role: llm.RoleUser, Content: scratchpadClosed})
 		}
 	}
 	return s.box
@@ -343,12 +375,48 @@ func (s *Session) evictIfIdle(d time.Duration) {
 	box := s.box
 	idle := !s.running && box != nil && time.Since(s.lastUsed) >= d && !box.Busy()
 	if idle {
-		s.box, s.evicted = nil, true
+		s.box = nil
+		s.evicted = s.evicted || usedScratchpad(s.history)
 	}
 	s.mu.Unlock()
 	if idle {
 		box.Close()
 	}
+}
+
+// settled reports whether the session has been idle for d with nothing
+// that lives only in memory, except notes, which retire saves: no
+// scratchpad, input, or approvals, and history that can be saved.
+// Dropping it then loses nothing; it is loaded again from its file.
+func (s *Session) settled(d time.Duration) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	// Notes can be saved only in a conversation that has begun; in a new
+	// one they'd count as its start, and it would never wake.
+	return s.cfg.Dir != "" && !s.keepFile && !s.closed && !s.running && s.box == nil &&
+		len(s.inbox) == 0 && len(s.approvals) == 0 && (len(s.notes) == 0 || started(s.history)) &&
+		time.Since(s.lastUsed) >= d
+}
+
+// retire marks a settled session closed once its history is saved,
+// reporting whether it was. Pending notes join the history first, as the
+// next turn would add them. A closed session ignores input, so nothing
+// reaches a session that is no longer in the map. A failed save is left
+// for the next try rather than reported: the session's own saves report
+// failures, and this runs on every janitor tick.
+func (s *Session) retire() bool {
+	s.mu.Lock()
+	s.history = append(s.history, s.notes...)
+	s.notes = nil
+	current := s.gen == s.savedGen && len(s.history) == s.savedLen
+	s.mu.Unlock()
+	if !current && s.write() != nil {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.closed = true
+	return true
 }
 
 // close stops the session, waits for its running turn to finish and save,
@@ -416,17 +484,28 @@ func (s *Session) load() []llm.Message {
 // history after acquiring saveMu, so the last save always writes the newest
 // state.
 func (s *Session) save() {
+	if err := s.write(); err != nil {
+		s.emit(Notice{Text: "Couldn't save history: " + err.Error()})
+	}
+}
+
+// write is save without telling the user about failures.
+func (s *Session) write() error {
 	if s.cfg.Dir == "" || s.keepFile {
-		return
+		return nil
 	}
 	s.saveMu.Lock()
 	defer s.saveMu.Unlock()
 	s.mu.Lock()
-	h := slices.Clone(s.history)
+	h, gen := slices.Clone(s.history), s.gen
 	s.mu.Unlock()
 	if err := datafile.Write(s.path(), historyVersion, h); err != nil {
-		s.emit(Notice{Text: "Couldn't save history: " + err.Error()})
+		return err
 	}
+	s.mu.Lock()
+	s.savedGen, s.savedLen = gen, len(h)
+	s.mu.Unlock()
+	return nil
 }
 
 // wake starts a new conversation with what the memory, if any, recalls.
@@ -440,9 +519,9 @@ func (s *Session) wake(ctx context.Context, gen int) error {
 		return nil
 	}
 	s.mu.Lock()
-	started := slices.ContainsFunc(s.history, func(m llm.Message) bool { return m.Role != llm.RoleSystem })
+	begun := started(s.history)
 	s.mu.Unlock()
-	if started {
+	if begun {
 		return nil
 	}
 	msgs, err := mem.Wake(ctx, s.id)

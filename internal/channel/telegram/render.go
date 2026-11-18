@@ -24,14 +24,15 @@ type (
 	stopping struct{}
 )
 
-// chat renders one chat's events. Events queue without blocking and are
-// applied in order by the chat's own goroutine, which does all the
+// chat renders the events of one place: a chat, or a topic in it. Events
+// queue without blocking and are applied in order by its own goroutine,
+// which does all the
 // network I/O: replies and notices become messages; streamed text and tool
 // activity show in a draft (private chats) or as a typing indicator
 // (groups, where drafts aren't available).
 type chat struct {
-	b  *Bot
-	id int64
+	b     *Bot
+	place place
 
 	mu    sync.Mutex
 	queue []any
@@ -44,8 +45,9 @@ type chat struct {
 	text                             string // reply text streamed since the last sent message
 	status                           string // latest tool activity
 	draftID                          int64
-	dirty                            bool // the draft is out of date
-	showing                          bool // a draft is on screen
+	draftSeq                         uint32 // draftID's counter part
+	dirty                            bool   // the draft is out of date
+	showing                          bool   // a draft is on screen
 	lastDraft, nextDraft, nextTyping time.Time
 	approvals                        map[string]approvalMessage // by request ID, while waiting
 }
@@ -60,10 +62,41 @@ type approvalMessage struct {
 	text string
 }
 
-func newChat(b *Bot, id int64) *chat {
+func newChat(b *Bot, p place) *chat {
 	// Private chats, the only ones with drafts, share their user's
 	// positive ID; group IDs are negative.
-	return &chat{b: b, id: id, wake: make(chan struct{}, 1), drafts: id > 0, draftID: 1}
+	c := &chat{b: b, place: p, wake: make(chan struct{}, 1), drafts: p.chat > 0}
+	c.newDraft()
+	return c
+}
+
+// newDraft moves on to a new draft: a sent message replaced the old one.
+func (c *chat) newDraft() {
+	c.draftSeq++
+	if c.draftSeq == 0 { // wrapped; draft IDs must be non-zero
+		c.draftSeq = 1
+	}
+	c.draftID = draftID(c.place.topic, c.draftSeq)
+}
+
+// idle reports whether the renderer holds nothing worth keeping: no turn,
+// draft on screen, or approval waiting for its outcome.
+func (c *chat) idle() bool {
+	return !c.active && !c.showing && len(c.approvals) == 0
+}
+
+// remove takes the renderer out of the bot's map unless an event arrived;
+// the next event starts a new one.
+func (c *chat) remove() bool {
+	c.b.mu.Lock()
+	defer c.b.mu.Unlock()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if len(c.queue) > 0 || c.b.chats[c.place] != c {
+		return false
+	}
+	delete(c.b.chats, c.place)
+	return true
 }
 
 func (c *chat) push(e any) {
@@ -99,13 +132,21 @@ func (c *chat) run() {
 			continue // deliver what's left, without drafts
 		}
 		var tick <-chan time.Time
-		if wait, ok := c.tick(); ok {
+		wait, ok := c.tick()
+		idle := !ok && c.idle()
+		if idle {
+			wait, ok = c.b.chatIdle, true
+		}
+		if ok {
 			timer.Reset(wait)
 			tick = timer.C
 		}
 		select {
 		case <-c.wake:
 		case <-tick:
+			if idle && c.remove() {
+				return
+			}
 		case <-c.b.closingCh:
 			closing = true
 		case <-c.b.ctx.Done():
@@ -191,10 +232,10 @@ func (c *chat) flush() {
 func (c *chat) send(text string) {
 	parts := split(text, maxText)
 	for i, p := range parts {
-		err := c.b.api.callRetry(c.b.ctx, "sendMessage", sendMessageParams{ChatID: c.id, Text: p}, nil, requestTimeout, c.b.sendAttempts)
+		err := c.b.api.callRetry(c.b.ctx, "sendMessage", sendMessageParams{ChatID: c.place.chat, MessageThreadID: c.place.topic, Text: p}, nil, requestTimeout, c.b.sendAttempts)
 		if err != nil {
 			if c.b.ctx.Err() == nil {
-				c.b.logf("chat %d: message not delivered: %v", c.id, err)
+				c.b.logf("%s: message not delivered: %v", c.place, err)
 			}
 			parts = parts[:i]
 			break
@@ -202,7 +243,7 @@ func (c *chat) send(text string) {
 	}
 	if len(parts) > 0 {
 		c.showing = false
-		c.draftID++
+		c.newDraft()
 	}
 }
 
@@ -219,8 +260,9 @@ func (c *chat) askApproval(e agent.ApprovalRequest) {
 	text = tail(text, maxText-100) // room for the outcome line
 	var sent message
 	err := c.b.api.callRetry(c.b.ctx, "sendMessage", sendMessageParams{
-		ChatID: c.id,
-		Text:   text,
+		ChatID:          c.place.chat,
+		MessageThreadID: c.place.topic,
+		Text:            text,
 		ReplyMarkup: &inlineKeyboard{InlineKeyboard: [][]inlineButton{{
 			{Text: "Allow", CallbackData: allowPrefix + e.ID},
 			{Text: "Refuse", CallbackData: refusePrefix + e.ID},
@@ -228,12 +270,12 @@ func (c *chat) askApproval(e agent.ApprovalRequest) {
 	}, &sent, requestTimeout, c.b.sendAttempts)
 	if err != nil {
 		if c.b.ctx.Err() == nil {
-			c.b.logf("chat %d: approval request not delivered: %v", c.id, err)
+			c.b.logf("%s: approval request not delivered: %v", c.place, err)
 		}
 		return // nobody can answer; the request expires
 	}
 	c.showing = false
-	c.draftID++
+	c.newDraft()
 	if c.approvals == nil {
 		c.approvals = map[string]approvalMessage{}
 	}
@@ -253,9 +295,9 @@ func (c *chat) approvalDone(e agent.ApprovalDone) {
 		agent.Expired:   "⌛ No answer in time, so it didn't run",
 		agent.Cancelled: "Cancelled",
 	}[e.Outcome]
-	err := c.b.api.callRetry(c.b.ctx, "editMessageText", editMessageTextParams{ChatID: c.id, MessageID: m.id, Text: m.text + "\n\n" + outcome}, nil, requestTimeout, c.b.sendAttempts)
+	err := c.b.api.callRetry(c.b.ctx, "editMessageText", editMessageTextParams{ChatID: c.place.chat, MessageID: m.id, Text: m.text + "\n\n" + outcome}, nil, requestTimeout, c.b.sendAttempts)
 	if err != nil && c.b.ctx.Err() == nil {
-		c.b.logf("chat %d: approval request not updated: %v", c.id, err)
+		c.b.logf("%s: approval request not updated: %v", c.place, err)
 	}
 }
 
@@ -311,11 +353,12 @@ func (c *chat) sendDraft(now time.Time) {
 	}
 	stop := c.b.polling.Load() // the stop button works only while polling
 	err := c.b.api.call(c.b.ctx, "sendMessageDraft", sendMessageDraftParams{
-		ChatID:     c.id,
-		DraftID:    c.draftID,
-		Text:       tail(text, maxText),
-		CanStop:    stop,
-		KeepOnStop: stop,
+		ChatID:          c.place.chat,
+		MessageThreadID: c.place.topic,
+		DraftID:         c.draftID,
+		Text:            tail(text, maxText),
+		CanStop:         stop,
+		KeepOnStop:      stop,
 	}, nil, requestTimeout)
 	switch {
 	case err == nil:
@@ -325,7 +368,7 @@ func (c *chat) sendDraft(now time.Time) {
 		c.nextDraft = now.Add(retryAfter(err))
 	case permanent(err):
 		c.drafts = false
-		c.b.logf("chat %d: drafts unavailable (%v); showing a typing indicator instead", c.id, err)
+		c.b.logf("%s: drafts unavailable (%v); showing a typing indicator instead", c.place, err)
 	default: // transient; try again later
 		c.nextDraft = now.Add(max(c.b.draftInterval, c.b.api.backoffMin))
 	}
@@ -333,7 +376,7 @@ func (c *chat) sendDraft(now time.Time) {
 
 func (c *chat) typing(now time.Time) {
 	c.nextTyping = now.Add(c.b.typingInterval)
-	err := c.b.api.call(c.b.ctx, "sendChatAction", sendChatActionParams{ChatID: c.id, Action: "typing"}, nil, requestTimeout)
+	err := c.b.api.call(c.b.ctx, "sendChatAction", sendChatActionParams{ChatID: c.place.chat, MessageThreadID: c.place.topic, Action: "typing"}, nil, requestTimeout)
 	if d := retryAfter(err); d > 0 {
 		c.nextTyping = now.Add(d)
 	}

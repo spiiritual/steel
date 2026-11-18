@@ -21,8 +21,58 @@ import (
 	"github.com/spiiritual/steel/internal/agent"
 )
 
-// IDPrefix starts the session ID of every Telegram chat: "telegram:<chat_id>".
+// IDPrefix starts the session ID of every Telegram conversation:
+// "telegram:<chat_id>" for a chat, "telegram:<chat_id>/<topic_id>" for a
+// topic in it.
 const IDPrefix = "telegram:"
+
+// place is where a conversation happens: a chat, or a topic in it. Each
+// place has its own session. Topic 0 is the chat outside any topic.
+type place struct{ chat, topic int64 }
+
+func (p place) String() string {
+	if p.topic == 0 {
+		return fmt.Sprintf("chat %d", p.chat)
+	}
+	return fmt.Sprintf("chat %d topic %d", p.chat, p.topic)
+}
+
+func (p place) sessionID() string {
+	id := IDPrefix + strconv.FormatInt(p.chat, 10)
+	if p.topic != 0 {
+		id += "/" + strconv.FormatInt(p.topic, 10)
+	}
+	return id
+}
+
+// parsePlace is sessionID's inverse.
+func parsePlace(id string) (place, bool) {
+	rest, ok := strings.CutPrefix(id, IDPrefix)
+	if !ok {
+		return place{}, false
+	}
+	c, t, hasTopic := strings.Cut(rest, "/")
+	var p place
+	var err error
+	if p.chat, err = strconv.ParseInt(c, 10, 64); err != nil {
+		return place{}, false
+	}
+	if hasTopic {
+		if p.topic, err = strconv.ParseInt(t, 10, 64); err != nil || p.topic == 0 {
+			return place{}, false
+		}
+	}
+	return p, true
+}
+
+// placeOf returns where m was sent.
+func placeOf(m *message) place {
+	p := place{chat: m.Chat.ID}
+	if m.IsTopicMessage {
+		p.topic = m.MessageThreadID
+	}
+	return p
+}
 
 const greeting = "Hi, I'm steel. Send me a message to start.\n\n" +
 	"/stop stops what I'm doing\n" +
@@ -54,6 +104,7 @@ type Bot struct {
 	typingInterval time.Duration // re-send the typing indicator before it expires
 	sendAttempts   int           // give up on a message after this many transient failures
 	closeTimeout   time.Duration // how long Close waits for pending messages
+	chatIdle       time.Duration // an idle renderer exits after this long
 
 	// ctx bounds outgoing messages; Close cancels it.
 	ctx    context.Context
@@ -63,8 +114,8 @@ type Bot struct {
 	polling atomic.Bool
 
 	mu        sync.Mutex
-	chats     map[int64]*chat
-	unknown   map[int64]bool // user IDs already logged as not allowed
+	chats     map[place]*chat // renderers; each removes itself once idle
+	unknown   map[int64]bool  // user IDs already logged as not allowed
 	closing   bool
 	closingCh chan struct{}
 	wg        sync.WaitGroup
@@ -82,7 +133,8 @@ func New(o Options) *Bot {
 		typingInterval: 4 * time.Second,  // typing lasts 5 seconds
 		sendAttempts:   5,
 		closeTimeout:   5 * time.Second,
-		chats:          map[int64]*chat{},
+		chatIdle:       10 * time.Minute,
+		chats:          map[place]*chat{},
 		unknown:        map[int64]bool{},
 		closingCh:      make(chan struct{}),
 	}
@@ -201,7 +253,7 @@ func (b *Bot) handle(ss sender, botName string, u update) {
 	if s := u.StoppedMessageGeneration; s != nil {
 		// Drafts exist only in private chats, whose ID is the user's.
 		if s.Chat.Type == "private" && b.allowed[s.Chat.ID] {
-			b.stop(ss, s.Chat.ID, "/stop")
+			b.stop(ss, place{chat: s.Chat.ID, topic: draftTopic(int64(s.DraftID))}, "/stop")
 		}
 		return
 	}
@@ -223,10 +275,13 @@ func (b *Bot) handle(ss sender, botName string, u update) {
 		}
 		return
 	}
-	id := m.Chat.ID
+	p := placeOf(m)
+	if m.service() {
+		return
+	}
 	if m.Text == "" {
 		if m.Chat.Type == "private" {
-			b.push(id, agent.Notice{Text: "I can only read text messages for now."})
+			b.push(p, agent.Notice{Text: "I can only read text messages for now."})
 		}
 		return
 	}
@@ -234,22 +289,22 @@ func (b *Bot) handle(ss sender, botName string, u update) {
 	if !mine {
 		return // a command for another bot in the same group
 	}
-	sid := IDPrefix + strconv.FormatInt(id, 10)
+	sid := p.sessionID()
 	switch cmd {
 	case "/start":
-		b.push(id, agent.Notice{Text: greeting})
+		b.push(p, agent.Notice{Text: greeting})
 		return
 	case "/stop", "/new":
-		b.stop(ss, id, cmd)
+		b.stop(ss, p, cmd)
 	case "/reset":
 		ss.Send(sid, cmd)
 	default:
-		b.push(id, userSent{})
+		b.push(p, userSent{})
 		ss.Send(sid, strings.TrimSpace(cmd+" "+rest))
 		return
 	}
 	if rest != "" {
-		b.push(id, userSent{})
+		b.push(p, userSent{})
 		ss.Send(sid, rest)
 	}
 }
@@ -283,7 +338,7 @@ func (b *Bot) answer(ss sender, q *callbackQuery) {
 		}
 	}
 	chat := q.Message.Chat.ID
-	if ss.Answer(IDPrefix+strconv.FormatInt(chat, 10), id, allow) {
+	if ss.Answer(placeOf(q.Message).sessionID(), id, allow) {
 		reply("") // the request's ApprovalDone updates the message
 		return
 	}
@@ -294,13 +349,20 @@ func (b *Bot) answer(ss sender, q *callbackQuery) {
 	b.api.call(ctx, "editMessageReplyMarkup", editMessageReplyMarkupParams{ChatID: chat, MessageID: q.Message.MessageID}, nil, requestTimeout)
 }
 
-// stop sends a stopping command (/stop or /new) to chat id's session. The
-// chat's renderer hears first, so the reply streamed so far is kept ahead
-// of the session's acknowledgement.
-func (b *Bot) stop(ss sender, id int64, cmd string) {
-	b.push(id, stopping{})
-	ss.Send(IDPrefix+strconv.FormatInt(id, 10), cmd)
+// stop sends a stopping command (/stop or /new) to p's session. p's
+// renderer hears first, so the reply streamed so far is kept ahead of the
+// session's acknowledgement.
+func (b *Bot) stop(ss sender, p place, cmd string) {
+	b.push(p, stopping{})
+	ss.Send(p.sessionID(), cmd)
 }
+
+// A draft ID carries its topic, since a stop button press names only the
+// chat and draft: the topic in the high 32 bits, a counter in the low.
+// Telegram accepts draft IDs beyond 2^53. Topic IDs are message IDs, which
+// fit in 31 bits.
+func draftID(topic int64, seq uint32) int64 { return topic<<32 | int64(seq) }
+func draftTopic(draft int64) int64          { return draft >> 32 }
 
 // commandRE matches Telegram's bot command syntax: "/" and up to 32
 // letters, digits, or underscores, optionally "@botname".
@@ -330,33 +392,28 @@ func command(text, botName string) (cmd, rest string, mine bool) {
 // Emit renders one session event in its chat. It never blocks on the
 // network and is safe for concurrent use.
 func (b *Bot) Emit(id string, e agent.Event) {
-	n, ok := strings.CutPrefix(id, IDPrefix)
-	if !ok {
-		return
+	if p, ok := parsePlace(id); ok {
+		b.push(p, e)
 	}
-	cid, err := strconv.ParseInt(n, 10, 64)
-	if err != nil {
-		return
-	}
-	b.push(cid, e)
 }
 
-// push queues e for chat id's renderer, starting it if needed.
-func (b *Bot) push(id int64, e any) {
+// push queues e for p's renderer, starting it if needed.
+func (b *Bot) push(p place, e any) {
 	b.mu.Lock()
 	if b.closing {
 		b.mu.Unlock()
 		return
 	}
-	c := b.chats[id]
+	c := b.chats[p]
 	if c == nil {
-		c = newChat(b, id)
-		b.chats[id] = c
+		c = newChat(b, p)
+		b.chats[p] = c
 		b.wg.Add(1)
 		go c.run()
 	}
-	b.mu.Unlock()
+	// Queued under b.mu, so a renderer removing itself sees it.
 	c.push(e)
+	b.mu.Unlock()
 }
 
 // Close delivers queued messages, waiting up to a few seconds, and stops
