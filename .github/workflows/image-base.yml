@@ -1,0 +1,39 @@
+# Rebuilds the image's desktop layers (Debian, Chromium, Node, agent-browser)
+# from scratch into the build cache, so security fixes reach the next
+# release. Releases reuse cached layers so that updating pulls only the new
+# binary; without this, those layers would never change. Nothing is
+# published here: the next release picks the fresh layers up, and that one
+# update downloads them in full.
+name: image-base
+
+on:
+  schedule:
+    - cron: "0 6 1 * *" # monthly
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write # write the build cache to ghcr.io
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: docker/setup-qemu-action@v4
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      # STEEL_SOURCE=source needs no release binaries. The desktop layers
+      # come before steel's in the Dockerfile, so their cache keys are the
+      # same ones a release build looks up.
+      - uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          no-cache: true
+          cache-to: type=registry,ref=ghcr.io/${{ github.repository }}:buildcache,mode=max
+          push: false
