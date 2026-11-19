@@ -93,7 +93,7 @@ type harness struct {
 func newHarness(t *testing.T, cfg Config, respond func(int, context.Context, llm.Request) (llm.Message, error)) *harness {
 	h := &harness{t: t, llm: &fakeLLM{respond: respond}, done: make(chan TurnDone, 16)}
 	cfg.Provider = h.llm
-	cfg.Model = "m"
+	cfg.Model = func() llm.Request { return llm.Request{Model: "m"} }
 	cfg.NewToolbox = func(hk Hooks) Toolbox {
 		b := &fakeBox{hooks: hk, release: make(chan struct{})}
 		h.mu.Lock()

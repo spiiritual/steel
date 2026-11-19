@@ -92,12 +92,41 @@ type Options struct {
 	Log          io.Writer    // default os.Stderr
 }
 
+// Login signs in to a Claude subscription for /login, and out for /logout.
+// The flow is headless: the URL is sent to the chat, and the next message
+// is the code Anthropic shows.
+type Login interface {
+	Begin() (LoginFlow, error)
+	// Logout forgets the login, returning what to tell the user.
+	Logout() (string, error)
+}
+
+// LoginFlow is one login in progress.
+type LoginFlow interface {
+	URL() string
+	// Finish completes the login, returning what to tell the user.
+	Finish(ctx context.Context, code string) (string, error)
+}
+
+// Models shows and changes the models steel uses, for /model. Each setter
+// returns what to tell the user.
+type Models interface {
+	// Describe says which models are in use and how to change them.
+	Describe() string
+	SetModel(name string) (string, error)
+	// SetCompactModel sets the model that writes memory's summaries.
+	SetCompactModel(name string) (string, error)
+	SetEffort(level string) (string, error)
+}
+
 // Bot is a Telegram channel.
 type Bot struct {
 	api       *client
 	allowed   map[int64]bool
 	schedules Schedules // nil: no /schedules
 	secrets   Secrets   // nil: /secret can't save
+	login     Login     // nil: no /login
+	models    Models    // nil: no /model
 	log       io.Writer
 	logMu     sync.Mutex
 
@@ -121,6 +150,7 @@ type Bot struct {
 	mu        sync.Mutex
 	chats     map[place]*chat // renderers; each removes itself once idle
 	waits     map[place]*secretWait
+	logins    map[place]*loginWait
 	unknown   map[int64]bool // user IDs already logged as not allowed
 	closing   bool
 	closingCh chan struct{}
@@ -143,6 +173,7 @@ func New(o Options) *Bot {
 		secretTimeout:  5 * time.Minute,
 		chats:          map[place]*chat{},
 		waits:          map[place]*secretWait{},
+		logins:         map[place]*loginWait{},
 		unknown:        map[int64]bool{},
 		closingCh:      make(chan struct{}),
 	}
@@ -301,6 +332,9 @@ func (b *Bot) handle(ss sender, botName string, u update) {
 	if b.captureSecret(ss, p, m) {
 		return
 	}
+	if b.captureLogin(p, m) {
+		return
+	}
 	cmd, rest, mine := command(m.Text, botName)
 	if !mine {
 		return // a command for another bot in the same group
@@ -308,13 +342,29 @@ func (b *Bot) handle(ss sender, botName string, u update) {
 	sid := p.sessionID()
 	switch cmd {
 	case "/start":
-		b.push(p, agent.Notice{Text: greeting})
+		text := greeting
+		if b.models != nil {
+			text += "\n/model shows or changes the model"
+		}
+		if b.login != nil {
+			text += "\n/login signs in to a Claude subscription"
+		}
+		b.push(p, agent.Notice{Text: text})
 		return
 	case "/schedules":
 		b.push(p, b.scheduleList(p.chat))
 		return
 	case "/secret":
 		b.askSecret(p, strings.TrimSpace(rest))
+		return
+	case "/login":
+		b.beginLogin(p, m.From.ID)
+		return
+	case "/logout":
+		b.logout(p)
+		return
+	case "/model":
+		b.model(p, strings.TrimSpace(rest))
 		return
 	case "/stop", "/new":
 		b.stop(ss, p, cmd)
@@ -349,6 +399,13 @@ func (b *Bot) commands() []botCommand {
 	}
 	if b.secrets != nil {
 		cs = append(cs, botCommand{"secret", "Save a secret for tools: /secret NAME"})
+	}
+	if b.models != nil {
+		cs = append(cs, botCommand{"model", "Show or change the model: /model NAME"})
+	}
+	if b.login != nil {
+		cs = append(cs, botCommand{"login", "Sign in to a Claude subscription"})
+		cs = append(cs, botCommand{"logout", "Sign out of Claude, back to the API key"})
 	}
 	return cs
 }

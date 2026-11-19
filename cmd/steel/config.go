@@ -20,6 +20,7 @@ import (
 
 	"golang.org/x/term"
 
+	"github.com/spiiritual/steel/internal/anthropicauth"
 	"github.com/spiiritual/steel/internal/datafile"
 	"github.com/spiiritual/steel/internal/llm/openai"
 	"github.com/spiiritual/steel/internal/mcp"
@@ -32,9 +33,10 @@ type options struct {
 	baseURL, model, system, configPath, dataDir *string
 	memoryDir, compactModel                     *string
 	memorySystem                                *choice
+	auth, effort, cacheTTL                      *choice
 	allowedUsers                                *idList
 	idle, drain                                 *time.Duration
-	toolBudget                                  *int
+	toolBudget, maxOutputTokens                 *int
 	showVersion                                 *bool
 }
 
@@ -43,10 +45,16 @@ func defineFlags(fs *flag.FlagSet) *options {
 	o := &options{
 		allowedUsers: &idList{},
 		memorySystem: &choice{value: "optmem", options: memorySystemNames()},
+		auth:         &choice{value: "api-key", options: []string{"api-key", "claude-oauth"}},
+		effort:       &choice{value: "default", options: effortNames},
+		cacheTTL:     &choice{value: "1h", options: []string{"1h", "5m"}},
 	}
 	o.model = fs.String("model", "", summary("model"))
 	o.baseURL = fs.String("base-url", openai.DefaultBaseURL, summary("base-url"))
 	o.system = fs.String("system", "", summary("system"))
+	fs.Var(o.auth, "auth", summary("auth"))
+	fs.Var(o.effort, "effort", summary("effort"))
+	fs.Var(o.cacheTTL, "cache-ttl", summary("cache-ttl"))
 	fs.Var(o.allowedUsers, "telegram-allowed-users", summary("telegram-allowed-users"))
 	o.configPath = fs.String("config", defaultConfigPath(), `settings file, edited with "steel config"; secrets go in .env beside it`)
 	o.dataDir = fs.String("data", filepath.Join(home, ".steel", "sessions"), summary("data"))
@@ -55,6 +63,7 @@ func defineFlags(fs *flag.FlagSet) *options {
 	o.compactModel = fs.String("compact-model", "", summary("compact-model"))
 	o.idle = fs.Duration("idle", 30*time.Minute, summary("idle"))
 	o.toolBudget = fs.Int("tool-budget", 4000, summary("tool-budget"))
+	o.maxOutputTokens = fs.Int("max-output-tokens", 0, summary("max-output-tokens"))
 	o.drain = fs.Duration("drain", time.Minute, summary("drain"))
 	o.showVersion = fs.Bool("version", false, "print the version and exit")
 	return o
@@ -87,6 +96,13 @@ func secretsPath(configPath string) string {
 	return filepath.Join(filepath.Dir(configPath), "secrets.env")
 }
 
+// effortNames are the effort setting's values; "default" sends none.
+var effortNames = []string{"default", "low", "medium", "high", "xhigh", "max"}
+
+// oauthPath is where a Claude OAuth login's tokens are saved: steel's own
+// .env, with its other tokens.
+func oauthPath(configPath string) string { return dotenvPath(configPath) }
+
 // secretPath is the file secret variable envVar is saved in.
 func secretPath(configPath, envVar string) string {
 	if isOwn(envVar) {
@@ -95,10 +111,11 @@ func secretPath(configPath, envVar string) string {
 	return secretsPath(configPath)
 }
 
-// isOwn reports whether envVar is one of steel's own variables: a token
-// or a setting's.
+// isOwn reports whether envVar is one of steel's own variables: a token,
+// the Claude login's, or a setting's.
 func isOwn(envVar string) bool {
 	return slices.ContainsFunc(secrets, func(s ownSecret) bool { return s.env == envVar }) ||
+		slices.Contains(anthropicauth.Vars, envVar) ||
 		slices.ContainsFunc(settings, func(s setting) bool { return s.env == envVar })
 }
 
@@ -171,7 +188,22 @@ Example: steel config set compact-model gpt-4.1-nano`,
 		details: `Any server that speaks the OpenAI chat completions API: OpenAI,
 OpenRouter, a local Ollama or llama.cpp server, and so on. Include the
 version path, without /chat/completions.
+Not used with auth claude-oauth, which always talks to Anthropic.
 Example: steel config set base-url http://localhost:11434/v1`,
+	},
+	{
+		flag: "auth", path: []string{"auth"},
+		summary: `how steel authenticates to the model: "api-key" or "claude-oauth"`,
+		details: `api-key: send openai-api-key (or the environment's OPENAI_API_KEY) as a
+bearer token to base-url. This is the usual OpenAI-compatible setup.
+claude-oauth: use a Claude Pro/Max subscription through Anthropic's Messages
+API. Run "steel login" once (or send /login on Telegram) and set a Claude
+model; tokens are kept next to config.json and refreshed automatically.
+OAuth requests carry the Claude Code identity and billing header, with
+Claude Code 2.1.323 reported. If a new model asks for a newer version, set
+STEEL_CLAUDE_CODE_VERSION, or let steel learn the floor from Anthropic's
+"claude_code_version_too_old" reply automatically.
+Example: steel config set auth claude-oauth`,
 	},
 	{
 		flag: "system", path: []string{"system"},
@@ -219,6 +251,35 @@ Example: steel config set memory-system optmem`,
 variables are gone, but the conversation's history is kept. 0 never closes
 it. A Go duration: 90s, 30m, 2h.
 Example: steel config set idle 2h`,
+	},
+	{
+		flag: "effort", path: []string{"effort"},
+		summary: `how hard the model thinks: "default", "low", "medium", "high", "xhigh" or "max"`,
+		details: `default leaves it to the model (Claude Opus 5.5 and Haiku 5.5 run at
+medium, Sonnet 5.5 at high). Higher effort thinks longer: better on hard
+tasks, slower and costlier. On Claude, a level the model lacks becomes the
+highest one below it. OpenAI-compatible providers get it as
+reasoning_effort (max as high), which only reasoning models accept.
+On Claude, memory summaries always run at low. /model effort LEVEL sets
+it from Telegram.
+Example: steel config set effort high`,
+	},
+	{
+		flag: "cache-ttl", path: []string{"cacheTTL"},
+		summary: `how long Claude keeps the prompt cache between requests: "1h" or "5m"`,
+		details: `With auth claude-oauth, the conversation so far is cached so each
+request pays mostly for what's new. 1h (the default) survives a pause of up
+to an hour between messages; writing it costs 2x a normal input token
+instead of 1.25x for 5m. Every cache hit restarts the clock either way.
+Example: steel config set cache-ttl 5m`,
+	},
+	{
+		flag: "max-output-tokens", path: []string{"maxOutputTokens"},
+		summary: "cap on each reply's tokens, thinking included; 0 is the model's maximum",
+		details: `0 (the default) lets every reply use all the model allows, so a long
+script or answer is never cut short. A number caps every turn's reply,
+whatever the provider; memory summaries keep their own smaller cap.
+Example: steel config set max-output-tokens 16000`,
 	},
 	{
 		flag: "tool-budget", path: []string{"toolBudget"},

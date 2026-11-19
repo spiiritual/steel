@@ -9,14 +9,15 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"slices"
 	"strings"
 	"syscall"
 	_ "time/tzdata" // schedules' zones, wherever steel runs
 
 	"github.com/spiiritual/steel/internal/agent"
+	"github.com/spiiritual/steel/internal/anthropicauth"
 	"github.com/spiiritual/steel/internal/bashcheck"
 	"github.com/spiiritual/steel/internal/channel/telegram"
-	"github.com/spiiritual/steel/internal/llm/openai"
 	"github.com/spiiritual/steel/internal/mcp"
 	"github.com/spiiritual/steel/internal/memory"
 	"github.com/spiiritual/steel/internal/schedule"
@@ -107,7 +108,7 @@ func run() error {
 	// user's secrets as they are now, so one entered a moment ago works.
 	// Never steel's own tokens: the model can write a server's config.
 	expand := func(name string) (string, bool) {
-		if _, own := tokens[name]; own {
+		if _, own := tokens[name]; own || slices.Contains(anthropicauth.Vars, name) {
 			return "", false
 		}
 		if v, ok := env.lookup(name); ok {
@@ -121,7 +122,13 @@ func run() error {
 		fmt.Fprintln(os.Stderr, "steel:", w)
 	}
 
-	provider := openai.New(*o.baseURL, apiKey)
+	live, err := newLiveModel(o, apiKey, store.SetRedacted)
+	if err != nil {
+		return err
+	}
+	provider := live.provider()
+	bot.SetLogin(live)
+	bot.SetModels(live)
 	usageLog := usage.NewLog(usagePath(*o.configPath), func(err error) {
 		fmt.Fprintln(os.Stderr, "steel: recording usage:", err)
 	})
@@ -143,7 +150,7 @@ func run() error {
 	system := systemPrompt(*o.system)
 	var mem memory.Memory
 	if *o.memoryDir != "" {
-		opened, err := openMemory(o, usageLog.Track(logCalls(provider, "compaction", os.Stderr), "compaction"))
+		opened, err := openMemory(o, usageLog.Track(logCalls(provider, "compaction", os.Stderr), "compaction"), live.summary)
 		if err != nil {
 			return err
 		}
@@ -184,7 +191,7 @@ func run() error {
 	tools.TrackRecent(recent)
 	sessions, err := agent.NewSessions(agent.Config{
 		Provider:    usageLog.Track(logCalls(provider, "turn", os.Stderr), "turn"),
-		Model:       *o.model,
+		Model:       live.turn,
 		System:      system,
 		Memory:      mem,
 		NewToolbox:  func(h agent.Hooks) agent.Toolbox { return newPad(tools, store, *o.toolBudget, h) },

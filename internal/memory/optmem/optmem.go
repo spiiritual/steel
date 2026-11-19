@@ -38,9 +38,12 @@ import (
 // Options configures a Memory.
 type Options struct {
 	// Provider and Model write the summaries. A summary is about 1 per
-	// note and small, so any model will do; a cheap one is enough.
+	// note and small, so any model will do; a cheap one is enough. Model
+	// returns the call each summary starts from (the model, and an effort
+	// if the provider takes one); it's read at each call, so it can change
+	// while the memory is open.
 	Provider llm.Provider
-	Model    string
+	Model    func() llm.Request
 	// Wait bounds how long Wake waits for summaries it needs. Default 1
 	// minute; past it, unwritten ones show as placeholders to zoom.
 	Wait time.Duration
@@ -79,6 +82,9 @@ func Open(dir string, o Options) (*Memory, error) {
 	}
 	if o.Now == nil {
 		o.Now = time.Now
+	}
+	if o.Model == nil {
+		o.Model = func() llm.Request { return llm.Request{} } // the provider's defaults
 	}
 	if o.OnError == nil {
 		o.OnError = func(error) {}
@@ -527,7 +533,9 @@ func (m *Memory) summarize(ctx context.Context, task string) (string, error) {
 	msgs := []llm.Message{{Role: llm.RoleUser, Content: task}}
 	const tries = 3
 	for try := 1; ; try++ {
-		reply, err := m.o.Provider.Stream(ctx, llm.Request{Model: m.o.Model, Messages: msgs, MaxTokens: summaryTokens}, func(string) error { return nil })
+		req := m.o.Model()
+		req.Messages, req.MaxTokens = msgs, summaryTokens
+		reply, err := m.o.Provider.Stream(ctx, req, func(string) error { return nil })
 		if err != nil && !errors.Is(err, llm.ErrTruncated) {
 			return "", err
 		}

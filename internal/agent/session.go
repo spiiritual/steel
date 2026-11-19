@@ -475,7 +475,9 @@ func (s *Session) turn(ctx context.Context, gen int) error {
 		// call has its result), and a kill that can't be caught, like a
 		// supervisor's after its stop timeout, then loses at most one step.
 		s.save()
-		reply, err := s.cfg.Provider.Stream(ctx, llm.Request{Model: s.cfg.Model, Messages: msgs, Tools: defs}, func(d string) error {
+		req := s.cfg.Model()
+		req.Messages, req.Tools = msgs, defs
+		reply, err := s.cfg.Provider.Stream(ctx, req, func(d string) error {
 			s.emit(TextDelta{Text: d})
 			return nil
 		})
@@ -655,8 +657,10 @@ func (s *Session) path() string {
 }
 
 // historyVersion is the format version of saved history files; bump it,
-// and migrate in load, when the format changes.
-const historyVersion = 1
+// and migrate in load, when the format changes. 2 added messages' blocks
+// (signed thinking), which version 1 files simply lack; the bump keeps an
+// older steel from rewriting a file without them.
+const historyVersion = 2
 
 // load reads saved history, replacing its system prompt with the current one.
 func (s *Session) load() []llm.Message {

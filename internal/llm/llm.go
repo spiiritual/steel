@@ -31,6 +31,11 @@ type Message struct {
 	ToolCalls []ToolCall `json:"tool_calls,omitempty"`
 	// ToolCallID links a RoleTool message to the call it answers.
 	ToolCallID string `json:"tool_call_id,omitempty"`
+	// Blocks is an assistant reply exactly as its provider returned it, for
+	// providers that need it sent back unchanged: Anthropic's signed thinking
+	// blocks. It's opaque to everything else, which uses Content and
+	// ToolCalls, and saved with history.
+	Blocks json.RawMessage `json:"blocks,omitempty"`
 	// Usage is what a reply cost, when the provider reports it. It isn't
 	// saved with history.
 	Usage *Usage `json:"-"`
@@ -70,6 +75,9 @@ type Request struct {
 	// MaxTokens caps the reply's tokens, reasoning included; 0 leaves it
 	// to the provider. A reply cut by the cap comes with ErrTruncated.
 	MaxTokens int
+	// Effort is how hard the model should think: "low", "medium", "high",
+	// "xhigh" or "max". "" leaves it to the model's default.
+	Effort string
 }
 
 // Provider generates completions from a model.

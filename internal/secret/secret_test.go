@@ -115,3 +115,12 @@ func TestRedactJSON(t *testing.T) {
 		t.Errorf("not JSON: %s", got)
 	}
 }
+
+func TestSetRedactedReplacesValue(t *testing.T) {
+	s, _ := testStore(t, "", Options{})
+	s.SetRedacted("TOKEN", "first")
+	s.SetRedacted("TOKEN", "second")
+	if got := s.Redact("first second"); got != "first {{secret:TOKEN}}" {
+		t.Errorf("Redact = %q", got)
+	}
+}

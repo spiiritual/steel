@@ -12,8 +12,8 @@ import (
 	"github.com/spiiritual/steel/internal/update"
 )
 
-// subcommand runs `steel config`, `steel update` or `steel rollback` if args
-// name one, reporting whether it did.
+// subcommand runs `steel config`, `steel login`, `steel update` and the rest
+// if args name one, reporting whether it did.
 func subcommand(args []string) (bool, error) {
 	if len(args) == 0 {
 		return false, nil
@@ -27,6 +27,10 @@ func subcommand(args []string) (bool, error) {
 		return true, runRollback()
 	case "usage":
 		return true, runUsage(args[1:], os.Stdout)
+	case "login":
+		return true, runLogin(args[1:])
+	case "logout":
+		return true, runLogout(args[1:])
 	}
 	return false, nil
 }

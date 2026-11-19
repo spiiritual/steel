@@ -78,7 +78,10 @@ type chatRequest struct {
 	// ToolChoice is "none" to forbid calls to Tools.
 	ToolChoice string `json:"tool_choice,omitempty"`
 	MaxTokens  int    `json:"max_tokens,omitempty"`
-	Stream     bool   `json:"stream"`
+	// ReasoningEffort is passed only when set; models that don't reason
+	// may reject it.
+	ReasoningEffort string `json:"reasoning_effort,omitempty"`
+	Stream          bool   `json:"stream"`
 	// StreamOptions asks for a final chunk with the request's usage.
 	StreamOptions *streamOptions `json:"stream_options,omitempty"`
 }
@@ -151,7 +154,11 @@ func toWire(req llm.Request) chatRequest {
 			Function: wireToolDef{Name: t.Name, Description: t.Description, Parameters: t.Parameters},
 		})
 	}
-	w := chatRequest{Model: req.Model, Messages: msgs, Tools: tools, MaxTokens: req.MaxTokens, Stream: true}
+	effort := req.Effort
+	if effort == "max" { // Anthropic's level; reasoning_effort tops out lower
+		effort = "high"
+	}
+	w := chatRequest{Model: req.Model, Messages: msgs, Tools: tools, MaxTokens: req.MaxTokens, ReasoningEffort: effort, Stream: true}
 	if req.NoToolCalls && len(tools) > 0 {
 		w.ToolChoice = "none"
 	}

@@ -417,7 +417,7 @@ func (streamer) Stream(ctx context.Context, _ llm.Request, onDelta func(string) 
 func TestStopEndToEnd(t *testing.T) {
 	f := newFakeAPI(t)
 	b, _, _ := testBot(t, f, 42)
-	ss, err := agent.NewSessions(agent.Config{Provider: streamer{}, Model: "m"}, b.Emit)
+	ss, err := agent.NewSessions(agent.Config{Provider: streamer{}, Model: func() llm.Request { return llm.Request{Model: "m"} }}, b.Emit)
 	if err != nil {
 		t.Fatal(err)
 	}

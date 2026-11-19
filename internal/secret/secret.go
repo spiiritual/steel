@@ -76,6 +76,19 @@ func Open(path string, o Options) (*Store, error) {
 	return s, nil
 }
 
+// SetRedacted makes name's value one more to redact, replacing the value
+// name had, for credentials steel learns after Open, such as refreshed OAuth
+// tokens.
+func (s *Store) SetRedacted(name, value string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.extra[name] == value {
+		return
+	}
+	s.extra[name] = value
+	s.redactor = newRedactor(s.vars, s.extra)
+}
+
 // loadLocked rereads the file if it changed since the last read. On error
 // the previous contents stay, so redaction keeps working.
 func (s *Store) loadLocked() error {

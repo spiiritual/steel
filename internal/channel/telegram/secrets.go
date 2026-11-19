@@ -139,7 +139,7 @@ func (b *Bot) captureSecret(ss sender, p place, m *message) bool {
 	if w == nil && !toPrompt {
 		return false
 	}
-	b.deleteSecretMessage(p, m)
+	b.deletePrivateMessage(p, m, "a secret")
 	value := strings.TrimSpace(m.Text)
 	switch {
 	case w != nil && w.own:
@@ -167,10 +167,10 @@ func (b *Bot) cancelSecret(ss sender, p place, id string) bool {
 	return ss.CancelSecret(p.sessionID(), id)
 }
 
-// deleteSecretMessage deletes m, the user's message with a secret, in the
-// background, so a slow Telegram doesn't hold up other updates, and tells
-// the user if it couldn't.
-func (b *Bot) deleteSecretMessage(p place, m *message) {
+// deletePrivateMessage deletes m, a message the bot asked for privately, in
+// the background, so a slow Telegram doesn't hold up other updates, and
+// tells the user if it couldn't.
+func (b *Bot) deletePrivateMessage(p place, m *message, what string) {
 	b.mu.Lock()
 	if b.closing {
 		b.mu.Unlock()
@@ -184,8 +184,8 @@ func (b *Bot) deleteSecretMessage(p place, m *message) {
 		defer cancel()
 		err := b.api.callRetry(ctx, "deleteMessage", deleteMessageParams{ChatID: m.Chat.ID, MessageID: m.MessageID}, nil, requestTimeout, b.sendAttempts)
 		if err != nil && b.ctx.Err() == nil {
-			b.logf("%s: deleting a message with a secret: %v", p, err)
-			b.push(p, agent.Notice{Text: "I couldn't delete your message with the secret: delete it yourself."})
+			b.logf("%s: deleting a message with %s: %v", p, what, err)
+			b.push(p, agent.Notice{Text: "I couldn't delete your message with " + what + ": delete it yourself."})
 		}
 	}()
 }

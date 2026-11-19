@@ -148,8 +148,11 @@ type Hooks struct {
 // Config describes how sessions are built.
 type Config struct {
 	Provider llm.Provider
-	Model    string
-	System   string // optional system prompt
+	// Model returns each turn's model call before its messages and tools:
+	// the model, and optionally a cap and effort. It's read at every call,
+	// so they can change while sessions run.
+	Model  func() llm.Request
+	System string // optional system prompt
 	// NewToolbox creates a session's toolbox; nil means no tools.
 	NewToolbox func(Hooks) Toolbox
 	// Dir stores one history file per session; "" keeps history in memory.

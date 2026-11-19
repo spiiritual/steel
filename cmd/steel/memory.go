@@ -25,12 +25,8 @@ type openedMemory struct {
 // setting. Adding one means a package implementing memory.Memory and an
 // entry here. summarizer is the provider for its background model calls,
 // if it makes any.
-var memorySystems = map[string]func(o *options, summarizer llm.Provider) (openedMemory, error){
-	"optmem": func(o *options, summarizer llm.Provider) (openedMemory, error) {
-		model := *o.compactModel
-		if model == "" {
-			model = *o.model
-		}
+var memorySystems = map[string]func(o *options, summarizer llm.Provider, model func() llm.Request) (openedMemory, error){
+	"optmem": func(o *options, summarizer llm.Provider, model func() llm.Request) (openedMemory, error) {
 		m, err := optmem.Open(*o.memoryDir, optmem.Options{
 			Provider: summarizer,
 			Model:    model,
@@ -53,6 +49,6 @@ func memorySystemNames() []string {
 }
 
 // openMemory opens the memory system o selects.
-func openMemory(o *options, summarizer llm.Provider) (openedMemory, error) {
-	return memorySystems[o.memorySystem.value](o, summarizer)
+func openMemory(o *options, summarizer llm.Provider, model func() llm.Request) (openedMemory, error) {
+	return memorySystems[o.memorySystem.value](o, summarizer, model)
 }
