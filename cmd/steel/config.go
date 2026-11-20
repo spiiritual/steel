@@ -246,10 +246,13 @@ Example: steel config set memory-system optmem`,
 	},
 	{
 		flag: "idle", path: []string{"idle"},
-		summary: "close a conversation's scratchpad after this much inactivity",
-		details: `Frees the memory of the JavaScript scratchpad behind run_code; its
-variables are gone, but the conversation's history is kept. 0 never closes
-it. A Go duration: 90s, 30m, 2h.
+		summary: "after this much inactivity, steel reflects on a conversation, then closes its scratchpad",
+		details: `First, if the model used tools since it last reflected, it gets a turn
+you don't see to save or fix skills from the work; keep this under
+cache-ttl so that turn reads the prompt cache. Then, once idle this long
+again, the JavaScript scratchpad behind run_code is freed; its variables
+are gone, but the conversation's history is kept. 0 does neither. A Go
+duration: 90s, 30m, 2h.
 Example: steel config set idle 2h`,
 	},
 	{

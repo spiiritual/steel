@@ -79,6 +79,7 @@ const greeting = "Hi, I'm steel. Send me a message to start.\n\n" +
 	"/reset clears my scratchpad\n" +
 	"/new starts a new conversation\n" +
 	"/schedules lists what's scheduled\n" +
+	"/skills lists what I've learned to do\n" +
 	"/secret NAME saves a secret for tools, out of the model's sight"
 
 // Options configure a Bot.
@@ -124,6 +125,7 @@ type Bot struct {
 	api       *client
 	allowed   map[int64]bool
 	schedules Schedules // nil: no /schedules
+	skills    Skills    // nil: no /skills
 	secrets   Secrets   // nil: /secret can't save
 	login     Login     // nil: no /login
 	models    Models    // nil: no /model
@@ -354,6 +356,9 @@ func (b *Bot) handle(ss sender, botName string, u update) {
 	case "/schedules":
 		b.push(p, b.scheduleList(p.chat))
 		return
+	case "/skills":
+		b.push(p, b.skillList())
+		return
 	case "/secret":
 		b.askSecret(p, strings.TrimSpace(rest))
 		return
@@ -396,6 +401,9 @@ func (b *Bot) commands() []botCommand {
 	}
 	if b.schedules != nil {
 		cs = append(cs, botCommand{"schedules", "List and cancel schedules"})
+	}
+	if b.skills != nil {
+		cs = append(cs, botCommand{"skills", "List and delete skills"})
 	}
 	if b.secrets != nil {
 		cs = append(cs, botCommand{"secret", "Save a secret for tools: /secret NAME"})
@@ -440,6 +448,10 @@ func (b *Bot) answer(ss sender, q *callbackQuery) {
 	}
 	if id, ok := strings.CutPrefix(q.Data, cancelSchedulePrefix); ok {
 		b.cancelSchedule(q, id, reply)
+		return
+	}
+	if key, ok := strings.CutPrefix(q.Data, deleteSkillPrefix); ok {
+		b.deleteSkill(q, key, reply)
 		return
 	}
 	if id, ok := strings.CutPrefix(q.Data, cancelSecretPrefix); ok {

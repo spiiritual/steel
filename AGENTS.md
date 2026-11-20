@@ -21,6 +21,7 @@ steel is a personal agent harness in Go. It's used mainly through Telegram and t
 | `internal/mcp` | MCP client: standard `mcpServers` config, tool adaptation, server guidance |
 | `internal/memory` | The `Memory` interface sessions use: `Wake` opens each new conversation |
 | `internal/memory/optmem` | The memory: model-written notes, a summary tree, wake ([OptMem](https://github.com/VictorTaelin/OptMem)) |
+| `internal/skill` | Skills: Agent Skills folders (`SKILL.md`) in `~/.steel/skills`, the model's `tools.skills.*`, the list each conversation starts with |
 | `internal/secret` | Dotenv files, the secret store (`secrets.env`), placeholders (fill and redact), `tools.secrets` |
 | `internal/datafile` | Versioned, atomic JSON files for all saved state |
 | `internal/update` | Signed-release check, download, verify, swap, rollback |
@@ -36,6 +37,7 @@ Don't undo these without discussing it first.
 - **Plugins are standards, not Go.** Extending steel means MCP servers and config files (same `mcpServers` format as Claude Desktop/Claude Code). Never require users to write Go.
 - **Memory systems are swappable.** `agent` knows only `memory.Memory`; `cmd/steel/memory.go` maps the `memory-system` setting to an implementation, which brings its own system prompt and tools.
 - **OptMem: the model takes notes.** `tools.memory.note/recall/zoom/rewrite`. Each new conversation's history starts with its wake (saved with it, so cached until `/new`). Summaries are written in the background by `compact-model`, never by the turn model. Files stay byte-compatible with OptMem's `memo`, so a directory can be shared with it.
+- **Skills: the model remembers how.** A skill is an [Agent Skills](https://agentskills.io) folder (`SKILL.md` + files) in `skills/` beside the config, so skills move between agents unchanged. The user drops them in or asks steel to install one; the model writes and updates its own with `tools.skills.write`, without approval, and the user is told of every change (`/skills` lists and deletes). Each new conversation's wake lists them (name + description); `tools.skills.read` opens one. When a conversation in which the model used tools goes idle (`-idle`, under the cache TTL), it gets a hidden turn (`skill.Reflect`) that requires thinking about skills, not writing one. Bash may touch `skills/` freely; the rest of steel's directory still asks.
 - **The model never sees a secret's value.** Scripts hold only placeholders (`{{secret:NAME}}`, from `tools.secrets.get`). The scratchpad fills them in only for tools marked `AcceptsSecrets` (bash, MCP), after the user approves the call as shown with placeholders, and redacts every value from every tool result and error. Users enter values through Telegram (`tools.secrets.add` or `/secret NAME`): the next message is taken, deleted and saved, never sent to a session.
 - **Layers stay separate.** `agent` doesn't know about channels; channels don't know about the model or tools.
 

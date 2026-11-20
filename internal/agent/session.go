@@ -13,6 +13,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/spiiritual/steel/internal/datafile"
@@ -31,6 +32,10 @@ type Session struct {
 	id   string
 	cfg  *Config
 	emit func(Event)
+
+	// hidden is set while the turn running is Reflect's alone: its text
+	// and tool calls aren't for the user. Input from them clears it.
+	hidden atomic.Bool
 
 	saveMu sync.Mutex // serializes snapshot+write so the newest state wins
 	// saved is the history last written to (or read from) the file, as
@@ -111,7 +116,13 @@ func (s *Session) busyLocked() bool {
 }
 
 func newSession(id string, cfg *Config, emit func(Event)) *Session {
-	s := &Session{id: id, cfg: cfg, emit: emit, lastUsed: time.Now()}
+	s := &Session{id: id, cfg: cfg, lastUsed: time.Now()}
+	s.emit = func(e Event) {
+		if s.hidden.Load() && !shownWhileHidden(e) {
+			return
+		}
+		emit(e)
+	}
 	s.history = s.load()
 	s.savedLen = len(s.history)
 	// A saved conversation's scratchpad didn't survive: steel restarted, or
@@ -380,6 +391,7 @@ func (s *Session) enqueueLocked(m llm.Message, wait bool) (<-chan TurnResult, er
 	}
 	s.inbox = append(s.inbox, q)
 	s.lastUsed = time.Now()
+	s.hidden.Store(false)
 	if !s.running {
 		s.running = true
 		s.loopDone = make(chan struct{})
@@ -427,6 +439,7 @@ func (s *Session) loop(done chan struct{}) {
 		if len(s.inbox) == 0 {
 			s.running, s.cancel = false, nil
 			s.lastUsed = time.Now()
+			s.hidden.Store(false)
 			s.mu.Unlock()
 			return
 		}
@@ -588,6 +601,53 @@ func (s *Session) evictIfIdle(d time.Duration) {
 	}
 }
 
+// reflectIfDue starts the turn that puts Reflect to the model, if the
+// session has been idle for d since work it hasn't reflected on.
+func (s *Session) reflectIfDue(d time.Duration) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.reflectDueLocked() || s.closed || s.busyLocked() || time.Since(s.lastUsed) < d {
+		return
+	}
+	s.enqueueLocked(steelNote(s.cfg.Reflect), false)
+	s.hidden.Store(true) // before the turn can emit: it waits for s.mu
+}
+
+// reflectDueLocked reports whether the model has worked since it was last
+// asked to reflect: a message from the user (or a job, or a schedule)
+// was followed by tool calls. The reflection's own tool calls come after
+// it, so they don't count. Callers hold s.mu.
+func (s *Session) reflectDueLocked() bool {
+	if s.cfg.Reflect == "" {
+		return false
+	}
+	asked := steelNote(s.cfg.Reflect).Content
+	usedTools := false
+	for _, m := range slices.Backward(s.history) {
+		switch {
+		case m.Role == llm.RoleUser && m.Content == asked:
+			return false
+		case len(m.ToolCalls) > 0:
+			usedTools = true
+		case m.Role == llm.RoleUser && usedTools:
+			return true
+		}
+	}
+	return false
+}
+
+// shownWhileHidden reports whether e reaches the user during a hidden
+// turn: what needs them (approvals, secrets) and errors do.
+func shownWhileHidden(e Event) bool {
+	switch e := e.(type) {
+	case TextDelta, Reply, ToolStart, ToolEnd:
+		return false
+	case TurnDone:
+		return e.Err != nil
+	}
+	return true
+}
+
 // settled reports whether the session has been idle for d with nothing
 // that lives only in memory, except notes, which retire saves: no
 // scratchpad, input, or approvals, and history that can be saved.
@@ -597,7 +657,9 @@ func (s *Session) settled(d time.Duration) bool {
 	defer s.mu.Unlock()
 	// Notes can be saved only in a conversation that has begun; in a new
 	// one they'd count as its start, and it would never wake.
-	return s.cfg.Dir != "" && !s.keepFile && !s.closed && !s.running && s.box == nil &&
+	// One due to reflect waits for that, so a short IdleTimeout can't
+	// retire it first.
+	return s.cfg.Dir != "" && !s.keepFile && !s.closed && !s.running && s.box == nil && !s.reflectDueLocked() &&
 		len(s.inbox) == 0 && len(s.approvals) == 0 && (len(s.notes) == 0 || started(s.history)) &&
 		time.Since(s.lastUsed) >= d
 }

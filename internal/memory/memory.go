@@ -19,3 +19,36 @@ type Memory interface {
 	// bounds that.
 	Wake(ctx context.Context, chat string) ([]llm.Message, error)
 }
+
+// Join is one memory made of several, e.g. notes and skills: a new
+// conversation wakes with each one's messages in turn. Nil ones are
+// skipped; with none left, Join is nil.
+func Join(ms ...Memory) Memory {
+	var j joined
+	for _, m := range ms {
+		if m != nil {
+			j = append(j, m)
+		}
+	}
+	switch len(j) {
+	case 0:
+		return nil
+	case 1:
+		return j[0]
+	}
+	return j
+}
+
+type joined []Memory
+
+func (j joined) Wake(ctx context.Context, chat string) ([]llm.Message, error) {
+	var out []llm.Message
+	for _, m := range j {
+		msgs, err := m.Wake(ctx, chat)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, msgs...)
+	}
+	return out, nil
+}

@@ -163,4 +163,11 @@ type Config struct {
 	// IdleTimeout closes the toolboxes of sessions idle this long, freeing
 	// their memory; 0 never closes them.
 	IdleTimeout time.Duration
+	// Reflect, if set, is put to the model when a conversation goes idle
+	// for IdleTimeout after the user asked for something it used tools
+	// for: a turn to look back and keep what it learned, read from the
+	// prompt cache while that's still warm. The turn is hidden from the
+	// user, unless they write meanwhile, and comes once per stretch of
+	// work, so an idle conversation isn't asked again.
+	Reflect string
 }

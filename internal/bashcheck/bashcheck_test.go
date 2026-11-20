@@ -88,3 +88,30 @@ func TestAsks(t *testing.T) {
 		}
 	}
 }
+
+// Skills live in steel's directory but are the model's to use: reading,
+// running and writing them doesn't ask, and the rest stays protected.
+func TestUnprotected(t *testing.T) {
+	o := opts
+	o.Unprotected = []string{"/home/me/.steel/skills"}
+	for _, cmd := range []string{
+		"cat ~/.steel/skills/deploy/SKILL.md",
+		"python3 ~/.steel/skills/expenses/fill.py",
+		"mkdir -p ~/.steel/skills/new && cat > ~/.steel/skills/new/run.sh <<'EOF'\necho hi\nEOF",
+		"ls ~/.steel/skills",
+	} {
+		if r := Check(cmd, o); len(r) > 0 {
+			t.Errorf("%s: asks %q", cmd, r)
+		}
+	}
+	for _, cmd := range []string{
+		"cat ~/.steel/skills/../.env",
+		"cat ~/.steel/.env",
+		"ls ~/.steel",
+		"ln -s ~/.steel/.env ~/.steel/skills/x/env",
+	} {
+		if r := Check(cmd, o); !strings.Contains(strings.Join(r, "\n"), "touches steel's own files") {
+			t.Errorf("%s: reasons %q, want it to touch steel's files", cmd, r)
+		}
+	}
+}

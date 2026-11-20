@@ -23,6 +23,7 @@ import (
 	"github.com/spiiritual/steel/internal/schedule"
 	"github.com/spiiritual/steel/internal/scratchpad"
 	"github.com/spiiritual/steel/internal/secret"
+	"github.com/spiiritual/steel/internal/skill"
 	"github.com/spiiritual/steel/internal/tool"
 	"github.com/spiiritual/steel/internal/usage"
 )
@@ -133,8 +134,16 @@ func run() error {
 		fmt.Fprintln(os.Stderr, "steel: recording usage:", err)
 	})
 	home, _ := os.UserHomeDir()
+	// skills/ sits next to the config, like schedules.json, so a test
+	// config elsewhere has its own.
+	skills, err := skill.Open(filepath.Join(filepath.Dir(*o.configPath), "skills"))
+	if err != nil {
+		return err
+	}
+	bot.SetSkills(skillList{skills})
 	// Commands touching steel's own state need approval: its settings,
-	// secrets, history and memory.
+	// secrets, history and memory. Skills are the model's to read, run and
+	// write, like its memory notes.
 	protected := []string{filepath.Dir(*o.configPath)}
 	for _, dir := range []string{*o.dataDir, *o.memoryDir} {
 		if dir != "" {
@@ -142,7 +151,7 @@ func run() error {
 		}
 	}
 	check := func(cmd string) []string {
-		return bashcheck.Check(cmd, bashcheck.Options{Dir: cwd, Home: home, Protected: protected})
+		return bashcheck.Check(cmd, bashcheck.Options{Dir: cwd, Home: home, Protected: protected, Unprotected: []string{skills.Dir()}})
 	}
 	bot.SetSecrets(store)
 	builtin := []tool.Tool{tool.Bash(cwd, check)}
@@ -158,6 +167,13 @@ func run() error {
 		mem, system = opened.memory, opened.system
 		builtin = append(builtin, opened.tools...)
 	}
+	system += "\n\n" + skill.Prompt(skills.Dir())
+	mem = memory.Join(mem, skills)
+	builtin = append(builtin, skill.Tools(skills, func(ctx context.Context, text string) {
+		if id := tool.Caller(ctx); id != "" {
+			bot.Emit(id, agent.Notice{Text: text})
+		}
+	})...)
 	sched, err := schedule.Open(schedule.Options{
 		Path:   filepath.Join(filepath.Dir(*o.configPath), "schedules.json"),
 		Places: bot,
@@ -197,6 +213,7 @@ func run() error {
 		NewToolbox:  func(h agent.Hooks) agent.Toolbox { return newPad(tools, store, *o.toolBudget, h) },
 		Dir:         *o.dataDir,
 		IdleTimeout: *o.idle,
+		Reflect:     skill.Reflect,
 	}, func(id string, e agent.Event) {
 		// The channel shows a failed turn to the user; the log keeps it
 		// for whoever runs steel.
@@ -286,3 +303,17 @@ func (l scheduleList) CancelSchedule(ctx context.Context, id string) (string, er
 }
 
 var _ schedule.Runner = scheduleRunner{}
+
+// skillList shows skills in Telegram's /skills.
+type skillList struct{ *skill.Store }
+
+func (l skillList) SkillList() []telegram.SkillEntry {
+	skills, _ := l.List()
+	var out []telegram.SkillEntry
+	for _, s := range skills {
+		out = append(out, telegram.SkillEntry{Name: s.Name, Description: s.Description})
+	}
+	return out
+}
+
+func (l skillList) DeleteSkill(name string) error { return l.Delete(name) }

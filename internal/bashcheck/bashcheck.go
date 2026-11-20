@@ -27,6 +27,11 @@ type Options struct {
 	// Protected are directories whose contents commands may only touch with
 	// approval: steel's own settings, secrets, history and memory.
 	Protected []string
+	// Unprotected are directories inside Protected that commands may touch
+	// freely: skills, which the model reads, runs and writes as it likes.
+	// A path is cleaned first, so .. can't climb out of one; linking to
+	// steel's files from one names them, and so asks.
+	Unprotected []string
 }
 
 // maxDepth bounds how deeply nested shell scripts (bash -c '…') are checked.
@@ -409,13 +414,23 @@ func (c *checker) protected(word string) {
 		return
 	}
 	path := c.abs(word)
+	for _, dir := range c.o.Unprotected {
+		if within(path, dir) {
+			return
+		}
+	}
 	for _, dir := range c.o.Protected {
-		dir = filepath.Clean(dir)
-		if path == dir || strings.HasPrefix(path, dir+string(filepath.Separator)) {
+		if within(path, dir) {
 			c.add("touches steel's own files (%s)", word)
 			return
 		}
 	}
+}
+
+// within reports whether path is dir or inside it.
+func within(path, dir string) bool {
+	dir = filepath.Clean(dir)
+	return path == dir || strings.HasPrefix(path, dir+string(filepath.Separator))
 }
 
 // abs resolves path against the current working directory.

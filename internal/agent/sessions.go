@@ -192,11 +192,26 @@ func (ss *Sessions) janitor() {
 				all = append(all, s)
 			}
 			ss.mu.Unlock()
+			ss.reflect(all)
 			for _, s := range all {
 				s.evictIfIdle(ss.cfg.IdleTimeout)
 			}
 			ss.retireSettled()
 		}
+	}
+}
+
+// reflect starts the reflection of every session due one. Before
+// evicting, so the model still has its scratchpad; never while draining,
+// which waits for work to end rather than start.
+func (ss *Sessions) reflect(all []*Session) {
+	ss.inputMu.RLock()
+	defer ss.inputMu.RUnlock()
+	if ss.draining {
+		return
+	}
+	for _, s := range all {
+		s.reflectIfDue(ss.cfg.IdleTimeout)
 	}
 }
 
