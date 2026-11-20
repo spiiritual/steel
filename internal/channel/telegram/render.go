@@ -1,6 +1,8 @@
 package telegram
 
 import (
+	"errors"
+	"net/http"
 	"strings"
 	"sync"
 	"time"
@@ -174,7 +176,7 @@ func (c *chat) apply(e any) {
 		c.dirty = true
 	case agent.Reply:
 		c.text, c.status = "", ""
-		c.send(e.Text)
+		c.sendFormatted(markdown(e.Text), nil)
 		// The message replaced the draft. Don't send an empty one (a
 		// "Thinking…" placeholder) or a typing indicator before TurnDone;
 		// a following tool call or text brings the draft back.
@@ -229,41 +231,55 @@ func (c *chat) activate() {
 	c.nextTyping = time.Time{}
 }
 
-// flush sends the streamed text not yet sent as a message.
+// flush sends the streamed reply text not yet sent as a message.
 func (c *chat) flush() {
 	t := c.text
 	c.text = ""
-	c.send(t)
+	c.sendFormatted(markdown(t), nil)
 }
 
-// send delivers text as one or more messages. A sent message replaces the
-// draft, so the next draft gets a new ID.
-func (c *chat) send(text string) { c.sendWith(text, nil) }
+// send delivers steel's own text, unformatted, as one or more messages.
+func (c *chat) send(text string) { c.sendFormatted(plain(text), nil) }
 
 // sendButtons sends a message with an inline keyboard.
-func (c *chat) sendButtons(m buttons) { c.sendWith(m.text, m.keyboard) }
+func (c *chat) sendButtons(m buttons) { c.sendFormatted(plain(m.text), m.keyboard) }
 
-// sendWith sends text, split as needed, with kb under its last part.
-func (c *chat) sendWith(text string, kb *inlineKeyboard) {
-	parts := split(text, maxText)
-	for i, p := range parts {
-		params := sendMessageParams{ChatID: c.place.chat, MessageThreadID: c.place.topic, Text: p}
+// sendFormatted sends f, split as needed, with kb under its last part. A
+// sent message replaces the draft, so the next draft gets a new ID.
+func (c *chat) sendFormatted(f formatted, kb *inlineKeyboard) {
+	parts := splitRanges(f.text, maxText)
+	sent := 0
+	for i, r := range parts {
+		params := sendMessageParams{ChatID: c.place.chat, MessageThreadID: c.place.topic, Text: f.text[r[0]:r[1]], Entities: f.entities(r[0], r[1]), LinkPreview: noPreview}
 		if i == len(parts)-1 {
 			params.ReplyMarkup = kb
 		}
 		err := c.b.api.callRetry(c.b.ctx, "sendMessage", params, nil, requestTimeout, c.b.sendAttempts)
+		if badEntities(err) && params.Entities != nil {
+			// The text matters more than its looks.
+			c.b.logf("%s: formatting refused (%v); sending it plain", c.place, err)
+			params.Entities = nil
+			err = c.b.api.callRetry(c.b.ctx, "sendMessage", params, nil, requestTimeout, c.b.sendAttempts)
+		}
 		if err != nil {
 			if c.b.ctx.Err() == nil {
 				c.b.logf("%s: message not delivered: %v", c.place, err)
 			}
-			parts = parts[:i]
 			break
 		}
+		sent++
 	}
-	if len(parts) > 0 {
+	if sent > 0 {
 		c.showing = false
 		c.newDraft()
 	}
+}
+
+// badEntities reports whether Telegram refused a message's entities, as
+// opposed to the message.
+func badEntities(err error) bool {
+	var ae *apiError
+	return errors.As(err, &ae) && ae.Code == http.StatusBadRequest && strings.Contains(strings.ToLower(ae.Description), "entit")
 }
 
 // askApproval sends an approval request with Allow and Refuse buttons.
@@ -302,6 +318,7 @@ func (c *chat) sendRequest(id, text string, buttons []inlineButton) bool {
 		ChatID:          c.place.chat,
 		MessageThreadID: c.place.topic,
 		Text:            text,
+		LinkPreview:     noPreview,
 		ReplyMarkup:     &inlineKeyboard{InlineKeyboard: [][]inlineButton{buttons}},
 	}, &sent, requestTimeout, c.b.sendAttempts)
 	if err != nil {
@@ -376,22 +393,38 @@ func later(a, b time.Time) time.Time {
 }
 
 func (c *chat) sendDraft(now time.Time) {
-	text := c.text
+	// Formatted as the reply will be. Half-written Markdown (an unclosed
+	// "**") shows as typed until it closes.
+	f := markdown(c.text)
 	if c.status != "" {
-		if strings.TrimSpace(text) != "" {
-			text += "\n\n"
+		if f.text != "" {
+			f.text += "\n\n"
 		}
-		text += c.status + "…"
+		f.text += c.status + "…"
+	}
+	// The end of a long draft, behind "…".
+	text, entities := f.text, f.entities(0, len(f.text))
+	if start := tailStart(f.text, maxText); start > 0 {
+		text, entities = "…"+f.text[start:], f.entities(start, len(f.text))
+		for i := range entities {
+			entities[i].Offset++ // "…" is one UTF-16 unit
+		}
 	}
 	stop := c.b.polling.Load() // the stop button works only while polling
-	err := c.b.api.call(c.b.ctx, "sendMessageDraft", sendMessageDraftParams{
+	params := sendMessageDraftParams{
 		ChatID:          c.place.chat,
 		MessageThreadID: c.place.topic,
 		DraftID:         c.draftID,
-		Text:            tail(text, maxText),
+		Text:            text,
+		Entities:        entities,
 		CanStop:         stop,
 		KeepOnStop:      stop,
-	}, nil, requestTimeout)
+	}
+	err := c.b.api.call(c.b.ctx, "sendMessageDraft", params, nil, requestTimeout)
+	if badEntities(err) && params.Entities != nil {
+		params.Entities = nil
+		err = c.b.api.call(c.b.ctx, "sendMessageDraft", params, nil, requestTimeout)
+	}
 	switch {
 	case err == nil:
 		c.showing, c.dirty = true, false
@@ -443,43 +476,65 @@ func prefix(s string, limit int) int {
 	return len(s)
 }
 
-// split cuts text into messages of at most limit UTF-16 code units,
-// preferring paragraph breaks, then line breaks, then spaces. The separator
-// at a cut is dropped; blank parts are skipped.
+// split cuts text into messages of at most limit UTF-16 code units; see
+// splitRanges.
 func split(text string, limit int) []string {
 	var parts []string
+	for _, r := range splitRanges(text, limit) {
+		parts = append(parts, text[r[0]:r[1]])
+	}
+	return parts
+}
+
+// splitRanges cuts text into parts of at most limit UTF-16 code units,
+// preferring paragraph breaks, then line breaks, then spaces, and returns
+// their byte ranges. The separator at a cut is dropped; blank parts are
+// skipped.
+func splitRanges(text string, limit int) [][2]int {
+	var parts [][2]int
+	base := 0
 	for {
-		if utf16Len(text) <= limit {
-			if strings.TrimSpace(text) != "" {
-				parts = append(parts, text)
+		rest := text[base:]
+		if utf16Len(rest) <= limit {
+			if strings.TrimSpace(rest) != "" {
+				parts = append(parts, [2]int{base, len(text)})
 			}
 			return parts
 		}
-		cut := prefix(text, limit)
+		cut := prefix(rest, limit)
 		if cut == 0 { // limit is narrower than one character
-			_, cut = utf8.DecodeRuneInString(text)
+			_, cut = utf8.DecodeRuneInString(rest)
 		}
 		end, next := cut, cut
 		for _, sep := range []string{"\n\n", "\n", " "} {
 			// Only in the second half, so parts aren't tiny.
-			if i := strings.LastIndex(text[:cut], sep); i > 0 && i >= cut/2 {
+			if i := strings.LastIndex(rest[:cut], sep); i > 0 && i >= cut/2 {
 				end, next = i, i+len(sep)
 				break
 			}
 		}
-		if p := text[:end]; strings.TrimSpace(p) != "" {
-			parts = append(parts, p)
+		if strings.TrimSpace(rest[:end]) != "" {
+			parts = append(parts, [2]int{base, base + end})
 		}
-		text = text[next:]
+		base += next
 	}
 }
 
 // tail returns s, or if it's over limit UTF-16 code units, "…" and as much
 // of its end as fits.
 func tail(s string, limit int) string {
+	if start := tailStart(s, limit); start > 0 {
+		return "…" + s[start:]
+	}
+	return s
+}
+
+// tailStart returns 0 if s fits in limit UTF-16 code units, else where
+// the end that fits behind a one-unit "…" starts, in bytes.
+func tailStart(s string, limit int) int {
 	n := utf16Len(s)
 	if n <= limit {
-		return s
+		return 0
 	}
 	// Drop the first n-(limit-1) units' worth of characters.
 	drop := prefix(s, n-limit+1)
@@ -487,7 +542,7 @@ func tail(s string, limit int) string {
 		_, w := utf8.DecodeRuneInString(s[drop:])
 		drop += w
 	}
-	return "…" + s[drop:]
+	return drop
 }
 
 // firstLine returns s's first line, cut to at most n runes.

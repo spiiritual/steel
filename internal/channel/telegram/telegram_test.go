@@ -218,7 +218,7 @@ func TestStreamingDraftsThenMessages(t *testing.T) {
 	}
 
 	b.Emit(id, agent.TextDelta{Text: "Let me "})
-	eventually(t, "first draft", hasDraft("Let me "))
+	eventually(t, "first draft", hasDraft("Let me")) // Telegram drops trailing spaces anyway
 	b.Emit(id, agent.TextDelta{Text: "look."})
 	eventually(t, "grown draft", hasDraft("Let me look."))
 	b.Emit(id, agent.Reply{Text: "Let me look."})
@@ -257,7 +257,7 @@ func TestStreamingDraftsThenMessages(t *testing.T) {
 		}
 		return 0
 	}
-	if idOf("Let me ") != idOf("Let me look.") || idOf("Let me look.") == idOf("⚙ run_code…") || idOf("⚙ run_code…") != idOf("Found it.") {
+	if idOf("Let me") != idOf("Let me look.") || idOf("Let me look.") == idOf("⚙ run_code…") || idOf("⚙ run_code…") != idOf("Found it.") {
 		t.Errorf("draft IDs: %v", drafts)
 	}
 }
@@ -454,7 +454,7 @@ func TestLongRepliesAreSplit(t *testing.T) {
 	b.Emit("telegram:42", agent.Reply{Text: reply})
 	eventually(t, "messages", func() bool { return len(f.callsOf("sendMessage")) == 2 })
 	parts := f.texts("sendMessage")
-	if utf16Len(parts[0]) > maxText || strings.Join(parts, " ") != reply {
+	if utf16Len(parts[0]) > maxText || strings.Join(parts, " ") != strings.TrimSpace(reply) {
 		t.Errorf("parts of %d and %d characters", utf16Len(parts[0]), utf16Len(parts[1]))
 	}
 }

@@ -99,7 +99,28 @@ type (
 		ChatID          int64           `json:"chat_id"`
 		MessageThreadID int64           `json:"message_thread_id,omitempty"`
 		Text            string          `json:"text"`
-		ReplyMarkup     *inlineKeyboard `json:"reply_markup,omitempty"`
+		Entities        []messageEntity `json:"entities,omitempty"`
+		// noPreview: a preview card of a reply's first link mostly
+		// clutters the chat.
+		LinkPreview *linkPreviewOptions `json:"link_preview_options,omitempty"`
+		ReplyMarkup *inlineKeyboard     `json:"reply_markup,omitempty"`
+	}
+	linkPreviewOptions struct {
+		IsDisabled bool `json:"is_disabled"`
+	}
+)
+
+var noPreview = &linkPreviewOptions{IsDisabled: true}
+
+type (
+	// messageEntity formats part of a message's text. Offset and Length
+	// count UTF-16 code units.
+	messageEntity struct {
+		Type     string `json:"type"`
+		Offset   int    `json:"offset"`
+		Length   int    `json:"length"`
+		URL      string `json:"url,omitempty"`      // text_link
+		Language string `json:"language,omitempty"` // pre
 	}
 	// editMessageTextParams without ReplyMarkup removes the message's
 	// buttons.
@@ -135,9 +156,10 @@ type (
 		MessageThreadID int64 `json:"message_thread_id,omitempty"`
 		DraftID         int64 `json:"draft_id"`
 		// Text may be empty: Telegram then shows a "Thinking…" placeholder.
-		Text       string `json:"text"`
-		CanStop    bool   `json:"can_stop,omitempty"`
-		KeepOnStop bool   `json:"keep_on_stop,omitempty"`
+		Text       string          `json:"text"`
+		Entities   []messageEntity `json:"entities,omitempty"`
+		CanStop    bool            `json:"can_stop,omitempty"`
+		KeepOnStop bool            `json:"keep_on_stop,omitempty"`
 	}
 	sendChatActionParams struct {
 		ChatID          int64  `json:"chat_id"`
