@@ -25,6 +25,7 @@ steel is a personal agent harness in Go. It's used mainly through Telegram and t
 | `internal/secret` | Dotenv files, the secret store (`secrets.env`), placeholders (fill and redact), `tools.secrets` |
 | `internal/datafile` | Versioned, atomic JSON files for all saved state |
 | `internal/update` | Signed-release check, download, verify, swap, rollback |
+| `internal/updater` | The update sidecar (`steel updater`): swaps steel's container for a signed release image on `/update`, restores it if the new one fails |
 
 ## Design decisions
 

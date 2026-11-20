@@ -25,6 +25,8 @@ func subcommand(args []string) (bool, error) {
 		return true, runUpdate(args[1:])
 	case "rollback":
 		return true, runRollback()
+	case "updater":
+		return true, runUpdater(args[1:])
 	case "usage":
 		return true, runUsage(args[1:], os.Stdout)
 	case "login":
@@ -97,7 +99,7 @@ func notInContainer() error {
 	if os.Getenv("STEEL_CONTAINER") == "" {
 		return nil
 	}
-	return errors.New("steel runs in a container here, so it updates with its image: on the host, run `docker compose pull && docker compose up -d`, or pin an earlier image tag to roll back")
+	return errors.New("steel runs in a container here, so it updates with its image: send /update in Telegram if compose.yaml has the updater service, or on the host run `docker compose pull && docker compose up -d`")
 }
 
 // executable is this binary's real path: updates replace the file, not a

@@ -129,6 +129,7 @@ type Bot struct {
 	secrets   Secrets   // nil: /secret can't save
 	login     Login     // nil: no /login
 	models    Models    // nil: no /model
+	updates   Updates   // nil: /update and /rollback say how to update instead
 	log       io.Writer
 	logMu     sync.Mutex
 
@@ -351,7 +352,13 @@ func (b *Bot) handle(ss sender, botName string, u update) {
 		if b.login != nil {
 			text += "\n/login signs in to a Claude subscription"
 		}
+		if b.updates != nil {
+			text += "\n/update updates me"
+		}
 		b.push(p, agent.Notice{Text: text})
+		return
+	case "/update", "/rollback":
+		b.offerUpdate(p, cmd)
 		return
 	case "/schedules":
 		b.push(p, b.scheduleList(p.chat))
@@ -415,6 +422,10 @@ func (b *Bot) commands() []botCommand {
 		cs = append(cs, botCommand{"login", "Sign in to a Claude subscription"})
 		cs = append(cs, botCommand{"logout", "Sign out of Claude, back to the API key"})
 	}
+	if b.updates != nil {
+		cs = append(cs, botCommand{"update", "Update steel to the newest release"})
+		cs = append(cs, botCommand{"rollback", "Go back to the previous version"})
+	}
 	return cs
 }
 
@@ -452,6 +463,10 @@ func (b *Bot) answer(ss sender, q *callbackQuery) {
 	}
 	if key, ok := strings.CutPrefix(q.Data, deleteSkillPrefix); ok {
 		b.deleteSkill(q, key, reply)
+		return
+	}
+	if action, ok := updateAction(q.Data); ok {
+		b.startUpdate(q, action, reply)
 		return
 	}
 	if id, ok := strings.CutPrefix(q.Data, cancelSecretPrefix); ok {

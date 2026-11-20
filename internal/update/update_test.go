@@ -155,3 +155,39 @@ func TestNewer(t *testing.T) {
 		}
 	}
 }
+
+func TestImageDigest(t *testing.T) {
+	priv, u, _ := setup(t)
+	f := newFakeRelease(t, priv, "v1.2.0", "steel v1.2.0", []byte("new binary"))
+	digest := strings.Repeat("ab", sha256.Size)
+	resign := func(sums string) {
+		f.files["checksums.txt"] = []byte(sums)
+		f.files["checksums.txt.minisig"] = minisign.SignWithComments(priv, []byte(sums), "steel v1.2.0", "")
+	}
+	latest := func() (string, error) {
+		u.API = f.server.URL
+		r, err := u.Latest(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		return u.ImageDigest(context.Background(), r)
+	}
+
+	if _, err := latest(); err == nil {
+		t.Error("a release without an image line gave a digest")
+	}
+	base := string(f.files["checksums.txt"])
+	resign(base + digest + "  image\n")
+	if got, err := latest(); err != nil || got != "sha256:"+digest {
+		t.Errorf("ImageDigest = %q, %v", got, err)
+	}
+	// The digest is only as good as the signature over it.
+	f.files["checksums.txt"] = []byte(base + strings.Repeat("cd", sha256.Size) + "  image\n")
+	if got, err := latest(); err == nil {
+		t.Errorf("unsigned digest accepted: %q", got)
+	}
+	resign(base + "not-hex  image\n")
+	if got, err := latest(); err == nil {
+		t.Errorf("malformed digest accepted: %q", got)
+	}
+}

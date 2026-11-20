@@ -6,6 +6,9 @@
 // verifies, its trusted comment names the release's own version (so an old
 // signed release can't be republished under a newer tag), and the
 // downloaded binary matches its checksum.
+//
+// checksums.txt also carries the release image's digest, on a line named
+// ImageEntry, so the same signature covers the container image.
 package update
 
 import (
@@ -142,6 +145,28 @@ func (u *Updater) Install(ctx context.Context, r Release, exe string) error {
 		return fmt.Errorf("keeping the current binary: %w", err)
 	}
 	return os.Rename(tmp.Name(), exe)
+}
+
+// ImageEntry names the line of checksums.txt that holds the release
+// image's digest: the multi-platform index, as "<hex>  image".
+const ImageEntry = "image"
+
+// ImageDigest returns the digest ("sha256:<hex>") of r's container image,
+// read from its verified checksums. Pulling the image by this digest gets
+// exactly what the release signed.
+func (u *Updater) ImageDigest(ctx context.Context, r Release) (string, error) {
+	sums, err := u.verifiedChecksums(ctx, r)
+	if err != nil {
+		return "", err
+	}
+	sum, ok := sums[ImageEntry]
+	if !ok {
+		return "", fmt.Errorf("%s has no signed image digest", r.Version)
+	}
+	if b, err := hex.DecodeString(sum); err != nil || len(b) != sha256.Size {
+		return "", fmt.Errorf("%s: malformed image digest %q", r.Version, sum)
+	}
+	return "sha256:" + sum, nil
 }
 
 // verifiedChecksums downloads and verifies r's signed checksums.

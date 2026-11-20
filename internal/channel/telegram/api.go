@@ -124,9 +124,11 @@ type (
 	inlineKeyboard struct {
 		InlineKeyboard [][]inlineButton `json:"inline_keyboard"`
 	}
+	// inlineButton sends CallbackData to steel when pressed, or opens URL.
 	inlineButton struct {
 		Text         string `json:"text"`
-		CallbackData string `json:"callback_data"`
+		CallbackData string `json:"callback_data,omitempty"`
+		URL          string `json:"url,omitempty"`
 	}
 	sendMessageDraftParams struct {
 		ChatID          int64 `json:"chat_id"`
