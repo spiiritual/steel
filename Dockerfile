@@ -72,3 +72,8 @@ EXPOSE 6080
 # tini reaps the processes the agent leaves behind and passes SIGTERM to
 # steel alone, so the desktop stays up while steel finishes its work.
 ENTRYPOINT ["tini", "--", "steel-entrypoint"]
+
+# The updater reads which steel an image holds from this label. Last, so
+# a new version changes nothing before it.
+ARG VERSION
+LABEL org.opencontainers.image.version=$VERSION

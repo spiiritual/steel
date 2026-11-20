@@ -210,6 +210,15 @@ func run() error {
 	}
 	defer sessions.Close() // cancels whatever is still running
 	sched.Start(scheduleRunner{sessions})
+	// In Docker, compose.yaml's updater service replaces steel's container
+	// on /update; steel itself has no power to.
+	if url := os.Getenv("STEEL_UPDATER"); url != "" {
+		u := newUpdates(url, filepath.Join(filepath.Dir(*o.configPath), "update.json"), bot, func(format string, args ...any) {
+			fmt.Fprintf(os.Stderr, "steel: "+format+"\n", args...)
+		})
+		bot.SetUpdates(u)
+		go u.run(runCtx)
+	}
 
 	err = bot.Run(runCtx, sessions)
 	// Before draining, so no new run starts.
